@@ -1,7 +1,43 @@
 use fs::File;
-use io::{BufRead, BufReader, Read, Seek};
+use io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::collections::HashMap;
-use std::{fmt, fs, io, mem};
+use std::{fmt, fs, io, mem, ptr};
+
+pub enum LinkError {}
+
+impl fmt::Display for LinkError {
+	fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
+		match self {
+			_ => todo!(),
+		}
+	}
+}
+
+impl From<&LinkError> for String {
+	fn from(e: &LinkError) -> String {
+		format!("{e}")
+	}
+}
+
+pub enum LinkWarning {
+	SymNotFound(String),
+}
+
+impl fmt::Display for LinkWarning {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		use LinkWarning::*;
+		match self {
+			SymNotFound(s) => write!(f, "symbol not found: {s}"),
+		}
+	}
+}
+
+impl From<&LinkWarning> for String {
+	fn from(e: &LinkWarning) -> String {
+		format!("{e}")
+	}
+}
+
 
 pub enum ElfError {
 	NotAnElf,
@@ -12,7 +48,10 @@ pub enum ElfError {
 	BadMachine,
 	BadUtf8,
 	BadSymtab,
+	BadLink(u64),
 	BadRelHeader,
+	UnsupportedRelocation(u8),
+	BadSymIdx(u64),
 	IO(io::Error),
 }
 
@@ -23,7 +62,7 @@ impl From<&ElfError> for String {
 }
 
 impl fmt::Display for ElfError {
-	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), std::fmt::Error> {
+	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
 		use ElfError::*;
 		match self {
 			// Display for UnexpectedEof *should* be this but is less clear
@@ -42,6 +81,9 @@ impl fmt::Display for ElfError {
 			BadUtf8 => write!(f, "bad UTF-8 in ELF file"),
 			BadSymtab => write!(f, "bad ELF symbol table"),
 			BadRelHeader => write!(f, "bad ELF relocation header"),
+			UnsupportedRelocation(x) => write!(f, "unsupported relocation type: {x}"),
+			BadLink(i) => write!(f, "bad ELF link: {i}"),
+			BadSymIdx(i) => write!(f, "bad symbol index: {i}"),
 		}
 	}
 }
@@ -52,14 +94,61 @@ impl From<io::Error> for ElfError {
 	}
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-struct SourceIndex(u32);
+// to be more efficient™, we use integers to keep track of symbol names.
+type SymbolNameType = u32;
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+struct SymbolName(SymbolNameType);
+struct SymbolNames {
+	count: SymbolNameType,
+	to_string: Vec<String>,
+	by_string: HashMap<String, SymbolName>,
+}
 
+impl SymbolNames {
+	fn new() -> Self {
+		Self {
+			count: 0,
+			to_string: vec![],
+			by_string: HashMap::new(),
+		}
+	}
+
+	fn add(&mut self, name: String) -> SymbolName {
+		match self.by_string.get(&name) {
+			Some(id) => *id,
+			None => {
+				// new symbol
+				let id = SymbolName(self.count);
+				self.count += 1;
+				self.by_string.insert(name.clone(), id);
+				self.to_string.push(name);
+				id
+			}
+		}
+	}
+
+	#[allow(dead_code)]
+	fn get_str(&self, id: SymbolName) -> Option<&str> {
+		self.to_string.get(id.0 as usize).map(|s| &s[..])
+	}
+
+	#[allow(dead_code)]
+	fn get(&self, name: &str) -> Option<SymbolName> {
+		self.by_string.get(name).map(|r| *r)
+	}
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+struct SourceId(u32);
+
+#[derive(Copy, Clone, Debug)]
 enum SymbolType {
 	Function,
 	Object,
+	Other
 }
 
+#[derive(Copy, Clone, Debug)]
 enum SymbolValue {
 	Bss(u64),
 	Data(u64), // index into Linker.data
@@ -67,16 +156,17 @@ enum SymbolValue {
 }
 
 #[allow(dead_code)] // @TODO @TEMPORARY
+#[derive(Debug)]
 struct SymbolInfo {
 	r#type: SymbolType,
-	value: SymbolValue,
+	value: Option<SymbolValue>,
 	size: u64,
 }
 
 struct Symbols {
-	global: HashMap<String, SymbolInfo>,
-	weak: HashMap<String, SymbolInfo>,
-	local: HashMap<(SourceIndex, String), SymbolInfo>,
+	global: HashMap<SymbolName, SymbolInfo>,
+	weak: HashMap<SymbolName, SymbolInfo>,
+	local: HashMap<(SourceId, SymbolName), SymbolInfo>,
 }
 
 impl Symbols {
@@ -88,24 +178,76 @@ impl Symbols {
 		}
 	}
 
-	fn add_weak(&mut self, name: String, info: SymbolInfo) {
+	fn add_weak(&mut self, name: SymbolName, info: SymbolInfo) {
 		self.weak.insert(name, info);
 	}
 
-	fn add_local(&mut self, source: SourceIndex, name: String, info: SymbolInfo) {
+	fn add_local(&mut self, source: SourceId, name: SymbolName, info: SymbolInfo) {
 		self.local.insert((source, name), info);
 	}
 
-	fn add_global(&mut self, name: String, info: SymbolInfo) {
+	fn add_global(&mut self, name: SymbolName, info: SymbolInfo) {
 		self.global.insert(name, info);
+	}
+	
+	fn get(&self, source: SourceId, name: SymbolName) -> Option<&SymbolInfo> {
+		self.local.get(&(source, name))
+			.or_else(|| self.global.get(&name))
+			.or_else(|| self.weak.get(&name))
 	}
 }
 
 #[allow(dead_code)] // @TODO @TEMPORARY
+#[derive(Debug, Clone, Copy)]
+enum RelocationType {
+	Pc32,
+	GotOff32,
+	GotPc32,
+}
+
+impl RelocationType {
+	fn from_x86_u8(id: u8) -> Result<Self, ElfError> {
+		use RelocationType::*;
+		Ok(match id {
+			2 => Pc32,
+			9 => GotOff32,
+			10 => GotPc32,
+			_ => return Err(ElfError::UnsupportedRelocation(id)),
+		})
+	}
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // @TODO @TEMPORARY
 struct Relocation {
 	offset: u64,
-	info: u64,
+	source_id: SourceId,
+	sym: SymbolName,
+	r#type: RelocationType,
 	addend: i64,
+}
+
+impl Relocation {
+	fn new_x86(
+		symtab: &HashMap<u32, SymbolName>,
+		source_id: SourceId,
+		offset: u64,
+		info: u32,
+		addend: i32,
+	) -> Result<Self, ElfError> {
+		let r#type = info as u8;
+		let sym_idx = info >> 8;
+		match symtab.get(&sym_idx) {
+			Some(sym) => Ok(Self {
+				offset,
+				source_id,
+				sym: *sym,
+				r#type: RelocationType::from_x86_u8(r#type)?,
+				addend: addend.into(),
+			}),
+			None => Err(ElfError::BadSymIdx(sym_idx.into())),
+		}
+	}
 }
 
 #[repr(C)]
@@ -128,8 +270,10 @@ struct Linker {
 	data: Vec<u8>, // contains all data from all objects.
 	source_count: u32,
 	symbols: Symbols,
+	symbol_names: SymbolNames,
 	relocations: Vec<Relocation>,
 	sections: Vec<ElfShdr>,
+	warnings: Vec<LinkWarning>,
 	bss_size: u64,
 }
 
@@ -137,12 +281,14 @@ impl Linker {
 	fn new() -> Self {
 		Linker {
 			symbols: Symbols::new(),
+			symbol_names: SymbolNames::new(),
 			source_count: 0,
 			strtab_offset: 0,
 			bss_size: 0,
 			data: vec![],
 			sections: vec![],
 			relocations: vec![],
+			warnings: vec![],
 		}
 	}
 
@@ -154,13 +300,13 @@ impl Linker {
 		String::from_utf8(bytes).map_err(|_| ElfError::BadUtf8)
 	}
 
-	// returns name of symbol
+	// returns SymbolName corresponding to the symbol
 	fn add_symbol(
 		&mut self,
-		source: SourceIndex,
+		source: SourceId,
 		source_offset: u64,
 		reader: &mut BufReader<File>,
-	) -> Result<String, ElfError> {
+	) -> Result<SymbolName, ElfError> {
 		#[repr(C)]
 		pub struct ElfSym {
 			name: u32,
@@ -177,6 +323,7 @@ impl Linker {
 		let r#type = sym.info & 0xf;
 		let bind = sym.info >> 4;
 		let name = self.get_str(reader, sym.name)?;
+		let name_id = self.symbol_names.add(name);
 		let size = sym.size as u64;
 
 		const STT_OBJECT: u8 = 1;
@@ -191,7 +338,7 @@ impl Linker {
 		let r#type = match r#type {
 			STT_OBJECT => SymbolType::Object,
 			STT_FUNC => SymbolType::Function,
-			_ => return Ok(name), // what can we do
+			_ => SymbolType::Other,
 		};
 
 		let value = match sym.shndx {
@@ -201,7 +348,9 @@ impl Linker {
 				let ndx = ndx as usize;
 				match self.get_str(reader, self.sections[ndx].name)?.as_str() {
 					".text" | ".data" | ".data1" | ".rodata" | ".rodata1" => {
-						Some(SymbolValue::Data(source_offset + self.sections[ndx].offset as u64 + sym.value as u64))
+						Some(SymbolValue::Data(
+							source_offset + self.sections[ndx].offset as u64 + sym.value as u64,
+						))
 					}
 					".bss" => {
 						let p = self.bss_size;
@@ -214,25 +363,19 @@ impl Linker {
 			_ => None,
 		};
 
-		if let Some(value) = value {
-			let info = SymbolInfo {
-				r#type,
-				value,
-				size,
-			};
-			match bind {
-				STB_LOCAL => self.symbols.add_local(source, name.clone(), info),
-				STB_GLOBAL => self.symbols.add_global(name.clone(), info),
-				STB_WEAK => self.symbols.add_weak(name.clone(), info),
-				_ => {}
-			}
+		let info = SymbolInfo {
+			r#type,
+			value,
+			size,
+		};
+		match bind {
+			STB_LOCAL => self.symbols.add_local(source, name_id, info),
+			STB_GLOBAL => self.symbols.add_global(name_id, info),
+			STB_WEAK => self.symbols.add_weak(name_id, info),
+			_ => {}
 		}
 
-		Ok(name)
-	}
-
-	fn add_relocation(&mut self, offset: u64, info: u64, addend: i64) {
-		self.relocations.push(Relocation { offset, info, addend })
+		Ok(name_id)
 	}
 
 	pub fn process_object(&mut self, reader: &mut BufReader<File>) -> Result<(), ElfError> {
@@ -241,7 +384,7 @@ impl Linker {
 		reader.read_to_end(&mut self.data)?;
 		reader.seek(io::SeekFrom::Start(0))?;
 
-		let source_idx = SourceIndex(self.source_count);
+		let source_id = SourceId(self.source_count);
 		self.source_count += 1;
 
 		#[repr(C)]
@@ -267,7 +410,6 @@ impl Linker {
 			shnum: u16,
 			shstrndx: u16,
 		}
-
 
 		impl ElfHeader {
 			fn section_offset(&self, ndx: u16) -> u64 {
@@ -331,63 +473,147 @@ impl Linker {
 			if size % entsize != 0 || entsize < 16 {
 				return Err(BadSymtab);
 			}
-			let count = (size / entsize) as u64;
-			symtab.reserve(count as _);
+			let count: u32 = (size / entsize).try_into().map_err(|_| BadSymtab)?; // 4 billion symbols is ridiculous
+			symtab.reserve(count as usize);
 			for sym_idx in 0..count {
-				reader.seek(io::SeekFrom::Start(offset + sym_idx * entsize))?;
-				let name = self.add_symbol(source_idx, source_offset, reader)?;
+				reader.seek(io::SeekFrom::Start(offset + sym_idx as u64 * entsize))?;
+				let name = self.add_symbol(source_id, source_offset, reader)?;
 				symtab.insert(sym_idx, name);
 			}
 		}
-		
+
 		for shdr in sections_by_name.values() {
+			// we only process relocations relating to .symtab currently.
+			match self.sections.get(shdr.link as usize) {
+				None => continue,
+				Some(h) => if self.get_str(reader, h.name)? != ".symtab" {
+					continue
+				},
+			}
+			
+			fn read_relocations<RelType>(
+				reader: &mut BufReader<File>,
+				shdr: &ElfShdr,
+			) -> Result<Vec<RelType>, ElfError> {
+				let offset = shdr.offset as u64;
+				let size = shdr.size as u64;
+				let entsize = shdr.entsize as u64;
+				if size % entsize != 0 || entsize < mem::size_of::<RelType>() as u64 {
+					return Err(BadRelHeader);
+				}
+				let count = size / entsize;
+				let mut relocations = Vec::with_capacity(count as _);
+				// annoyingly, array sizes can't depend on the size of a type parameter.
+				// if they could, we could just use transmute and everyone would be happier.
+				let mut rel_buf = [0; 32];
+				let rel_data = &mut rel_buf[..mem::size_of::<RelType>()];
+
+				for rel_idx in 0..count {
+					reader.seek(io::SeekFrom::Start(offset + rel_idx * entsize))?;
+
+					reader.read_exact(rel_data)?;
+					let mut rel = mem::MaybeUninit::uninit();
+					let rel = unsafe {
+						ptr::copy_nonoverlapping(
+							(&rel_data[0]) as *const u8,
+							rel.as_mut_ptr() as *mut u8,
+							mem::size_of::<RelType>(),
+						);
+						rel.assume_init()
+					};
+
+					relocations.push(rel);
+				}
+				Ok(relocations)
+			}
+
+			let info_section_offset = source_offset
+				+ self
+					.sections
+					.get(shdr.info as usize)
+					.ok_or(BadLink(shdr.info as u64))?
+					.offset as u64;
+
+			let add_relocation_x86 =
+				|me: &mut Self, offset: u32, info: u32, addend: i32| -> Result<(), ElfError> {
+					me.relocations.push(Relocation::new_x86(
+						&symtab,
+						source_id,
+						info_section_offset + offset as u64,
+						info,
+						addend,
+					)?);
+					Ok(())
+				};
+
 			const SHT_RELA: u32 = 4;
 			const SHT_REL: u32 = 9;
 			match shdr.r#type {
 				SHT_RELA => {
-					let size = shdr.size as u64;
-					let entsize = shdr.entsize as u64;
-					if size % entsize != 0 || entsize < 12 {
-						return Err(BadRelHeader);
+					#[repr(C)]
+					struct ElfRela {
+						offset: u32,
+						info: u32,
+						addend: i32,
 					}
-					let count = size / entsize;
-					for _ in 0..count {
-						#[repr(C)]
-						struct ElfRela {
-							offset: u32,
-							info: u32,
-							addend: i32
-						}
-						let mut rela_buf = [0; 12];
-						reader.read_exact(&mut rela_buf)?;
-						let rela: ElfRela = unsafe { mem::transmute(rela_buf) };
-						self.add_relocation(rela.offset as _, rela.info as _, rela.addend as _);
+					let rels: Vec<ElfRela> = read_relocations(reader, shdr)?;
+					for rela in rels {
+						add_relocation_x86(
+							self,
+							rela.offset as _,
+							rela.info as _,
+							rela.addend as _,
+						)?;
 					}
-				},
+				}
 				SHT_REL => {
-					let size = shdr.size as u64;
-					let entsize = shdr.entsize as u64;
-					if size % entsize != 0 || entsize < 8 {
-						return Err(BadRelHeader);
+					#[repr(C)]
+					struct ElfRel {
+						offset: u32,
+						info: u32,
 					}
-					let count = size / entsize;
-					for _ in 0..count {
-						#[repr(C)]
-						struct ElfRel {
-							offset: u32,
-							info: u32,
-						}
-						let mut rel_buf = [0; 8];
-						reader.read_exact(&mut rel_buf)?;
-						let rel: ElfRel = unsafe { mem::transmute(rel_buf) };
-						self.add_relocation(rel.offset as _, rel.info as _, 0);
+					let rels: Vec<ElfRel> = read_relocations(reader, shdr)?;
+					for rel in rels {
+						add_relocation_x86(self, rel.offset as _, rel.info as _, 0)?;
 					}
-				},
-				_ => {},
+				}
+				_ => {}
 			}
 		}
 
 		Ok(())
+	}
+
+	fn get_sym_name(&self, id: SymbolName) -> Option<&str> {
+		self.symbol_names.get_str(id)
+	}
+	
+	// get symbol, producing a warning if it does not exist.
+	fn get_symbol(&mut self, source_id: SourceId, id: SymbolName) -> Option<&SymbolInfo> {
+		let sym = self.symbols.get(source_id, id);
+		if sym.is_none() {
+			let warn = LinkWarning::SymNotFound(self.get_sym_name(id).unwrap_or("???").into());
+			self.warnings.push(warn);
+		}
+		sym
+	}
+
+	fn apply_relocation(&mut self, rel: Relocation) -> Result<(), LinkError> {
+		let symbol = match self.get_symbol(rel.source_id, rel.sym) {
+			None => return Ok(()),
+			Some(sym) => sym,
+		};
+		println!("{symbol:?}");
+		Ok(())
+	}
+	
+	pub fn link<T: Write>(&mut self, _writer: &mut BufWriter<T>) -> Result<Vec<LinkWarning>, LinkError> {
+		// we have to use an index because for all rust knows,
+		// apply_relocation modifies self.relocations (it doesn't).
+		for i in 0..self.relocations.len() {
+			self.apply_relocation(self.relocations[i].clone())?;
+		}
+		Ok(mem::take(&mut self.warnings))
 	}
 }
 
@@ -435,5 +661,25 @@ fn main() {
 			eprintln!("Error processing object file {filename}: {e}");
 			return;
 		}
+	}
+
+	use std::os::unix::fs::OpenOptionsExt;
+	let mut out_options = fs::OpenOptions::new();
+	out_options
+		.write(true)
+		.create(true)
+		.truncate(true)
+		.mode(0o755);
+
+	let mut output = match out_options.open("a.out") {
+		Ok(out) => BufWriter::new(out),
+		Err(e) => {
+			eprintln!("Error opening output file: {e}");
+			return;
+		}
+	};
+
+	if let Err(e) = linker.link(&mut output) {
+		eprintln!("Error linking: {e}");
 	}
 }
