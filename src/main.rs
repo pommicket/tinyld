@@ -3,18 +3,31 @@ use io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::collections::HashMap;
 use std::{fmt, fs, io, mem, ptr};
 
-pub enum LinkError {}
+mod elf;
+
+pub enum LinkError {
+	IO(io::Error),
+	TooLarge,
+}
 
 impl fmt::Display for LinkError {
-	fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		use LinkError::*;
 		match self {
-			_ => todo!(),
+			IO(e) => write!(f, "IO error: {e}"),
+			TooLarge => write!(f, "executable file would be too large."),
 		}
 	}
 }
 
+impl From<io::Error> for LinkError {
+	fn from(e: io::Error) -> Self {
+		Self::IO(e)
+	}
+}
+
 impl From<&LinkError> for String {
-	fn from(e: &LinkError) -> String {
+	fn from(e: &LinkError) -> Self {
 		format!("{e}")
 	}
 }
@@ -33,11 +46,10 @@ impl fmt::Display for LinkWarning {
 }
 
 impl From<&LinkWarning> for String {
-	fn from(e: &LinkWarning) -> String {
+	fn from(e: &LinkWarning) -> Self {
 		format!("{e}")
 	}
 }
-
 
 pub enum ElfError {
 	NotAnElf,
@@ -145,7 +157,7 @@ struct SourceId(u32);
 enum SymbolType {
 	Function,
 	Object,
-	Other
+	Other,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -189,9 +201,10 @@ impl Symbols {
 	fn add_global(&mut self, name: SymbolName, info: SymbolInfo) {
 		self.global.insert(name, info);
 	}
-	
+
 	fn get(&self, source: SourceId, name: SymbolName) -> Option<&SymbolInfo> {
-		self.local.get(&(source, name))
+		self.local
+			.get(&(source, name))
 			.or_else(|| self.global.get(&name))
 			.or_else(|| self.weak.get(&name))
 	}
@@ -200,6 +213,7 @@ impl Symbols {
 #[allow(dead_code)] // @TODO @TEMPORARY
 #[derive(Debug, Clone, Copy)]
 enum RelocationType {
+	Direct32,
 	Pc32,
 	GotOff32,
 	GotPc32,
@@ -209,6 +223,7 @@ impl RelocationType {
 	fn from_x86_u8(id: u8) -> Result<Self, ElfError> {
 		use RelocationType::*;
 		Ok(match id {
+			1 => Direct32,
 			2 => Pc32,
 			9 => GotOff32,
 			10 => GotPc32,
@@ -250,21 +265,6 @@ impl Relocation {
 	}
 }
 
-#[repr(C)]
-#[derive(Clone)]
-struct ElfShdr {
-	name: u32,
-	r#type: u32,
-	flags: u32,
-	addr: u32,
-	offset: u32,
-	size: u32,
-	link: u32,
-	info: u32,
-	addralign: u32,
-	entsize: u32,
-}
-
 struct Linker {
 	strtab_offset: u64,
 	data: Vec<u8>, // contains all data from all objects.
@@ -272,7 +272,7 @@ struct Linker {
 	symbols: Symbols,
 	symbol_names: SymbolNames,
 	relocations: Vec<Relocation>,
-	sections: Vec<ElfShdr>,
+	sections: Vec<elf::Shdr32>,
 	warnings: Vec<LinkWarning>,
 	bss_size: u64,
 }
@@ -387,43 +387,9 @@ impl Linker {
 		let source_id = SourceId(self.source_count);
 		self.source_count += 1;
 
-		#[repr(C)]
-		struct ElfHeader {
-			ident: [u8; 4],
-			class: u8,
-			data: u8,
-			version: u8,
-			abi: u8,
-			abiversion: u8,
-			pad: [u8; 7],
-			r#type: u16,
-			machine: u16,
-			version2: u32,
-			entry: u32,
-			phoff: u32,
-			shoff: u32,
-			flags: u32,
-			ehsize: u16,
-			phentsize: u16,
-			phnum: u16,
-			shentsize: u16,
-			shnum: u16,
-			shstrndx: u16,
-		}
-
-		impl ElfHeader {
-			fn section_offset(&self, ndx: u16) -> u64 {
-				ndx as u64 * self.shentsize as u64 + self.shoff as u64
-			}
-
-			fn section_seek(&self, ndx: u16) -> io::SeekFrom {
-				io::SeekFrom::Start(self.section_offset(ndx))
-			}
-		}
-
 		let mut elf = [0u8; 0x34];
 		reader.read_exact(&mut elf)?;
-		let elf: ElfHeader = unsafe { mem::transmute(elf) };
+		let elf: elf::Header32 = unsafe { mem::transmute(elf) };
 
 		if elf.ident != [0x7f, b'E', b'L', b'F'] {
 			return Err(NotAnElf);
@@ -437,7 +403,7 @@ impl Linker {
 		if elf.version != 1 || elf.version2 != 1 {
 			return Err(BadVersion);
 		}
-		if elf.r#type != 1 {
+		if elf.r#type != elf::ET_REL {
 			return Err(BadType);
 		}
 		if elf.machine != 3 {
@@ -449,7 +415,7 @@ impl Linker {
 			// read .strtab header
 			reader.seek(elf.section_seek(elf.shstrndx))?;
 			reader.read_exact(&mut shdr_buf)?;
-			let shdr: ElfShdr = unsafe { mem::transmute(shdr_buf) };
+			let shdr: elf::Shdr32 = unsafe { mem::transmute(shdr_buf) };
 			shdr.offset as u64
 		};
 
@@ -458,7 +424,7 @@ impl Linker {
 		for s_idx in 0..elf.shnum {
 			reader.seek(elf.section_seek(s_idx))?;
 			reader.read_exact(&mut shdr_buf)?;
-			let shdr: ElfShdr = unsafe { mem::transmute(shdr_buf) };
+			let shdr: elf::Shdr32 = unsafe { mem::transmute(shdr_buf) };
 			let name = self.get_str(reader, shdr.name)?;
 			sections_by_name.insert(name.clone(), shdr.clone());
 			self.sections.push(shdr);
@@ -486,14 +452,16 @@ impl Linker {
 			// we only process relocations relating to .symtab currently.
 			match self.sections.get(shdr.link as usize) {
 				None => continue,
-				Some(h) => if self.get_str(reader, h.name)? != ".symtab" {
-					continue
-				},
+				Some(h) => {
+					if self.get_str(reader, h.name)? != ".symtab" {
+						continue;
+					}
+				}
 			}
-			
+
 			fn read_relocations<RelType>(
 				reader: &mut BufReader<File>,
-				shdr: &ElfShdr,
+				shdr: &elf::Shdr32,
 			) -> Result<Vec<RelType>, ElfError> {
 				let offset = shdr.offset as u64;
 				let size = shdr.size as u64;
@@ -587,7 +555,7 @@ impl Linker {
 	fn get_sym_name(&self, id: SymbolName) -> Option<&str> {
 		self.symbol_names.get_str(id)
 	}
-	
+
 	// get symbol, producing a warning if it does not exist.
 	fn get_symbol(&mut self, source_id: SourceId, id: SymbolName) -> Option<&SymbolInfo> {
 		let sym = self.symbols.get(source_id, id);
@@ -603,16 +571,46 @@ impl Linker {
 			None => return Ok(()),
 			Some(sym) => sym,
 		};
-		println!("{symbol:?}");
+		println!("{rel:?} {symbol:?}");
 		Ok(())
 	}
-	
-	pub fn link<T: Write>(&mut self, _writer: &mut BufWriter<T>) -> Result<Vec<LinkWarning>, LinkError> {
+
+	pub fn link<T: Write>(
+		&mut self,
+		out: &mut BufWriter<T>,
+	) -> Result<Vec<LinkWarning>, LinkError> {
 		// we have to use an index because for all rust knows,
 		// apply_relocation modifies self.relocations (it doesn't).
 		for i in 0..self.relocations.len() {
 			self.apply_relocation(self.relocations[i].clone())?;
 		}
+
+		const SEGMENT_ADDR: u32 = 0x400000;
+
+		let data_size = 0;
+
+		let mut header = elf::Header32::default();
+		let header_size: u32 = header.ehsize.into();
+		let phdr_size: u32 = header.phentsize.into();
+		let file_size = header_size + phdr_size + data_size;
+		let entry_point = SEGMENT_ADDR + header_size + phdr_size;
+		header.phnum = 1;
+		header.phoff = header_size;
+		header.entry = entry_point;
+		out.write_all(&header.to_bytes())?;
+
+		let bss_size: u32 = self.bss_size.try_into().map_err(|_| LinkError::TooLarge)?;
+
+		let phdr = elf::Phdr32 {
+			flags: 0b111, // read, write, execute
+			offset: 0,
+			vaddr: SEGMENT_ADDR,
+			filesz: file_size,
+			memsz: file_size + bss_size,
+			..Default::default()
+		};
+		out.write_all(&phdr.to_bytes())?;
+
 		Ok(mem::take(&mut self.warnings))
 	}
 }
