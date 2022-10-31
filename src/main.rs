@@ -1,6 +1,6 @@
 use fs::File;
 use io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::{fmt, fs, io, mem, ptr};
 
 mod elf;
@@ -34,6 +34,7 @@ impl From<&LinkError> for String {
 
 pub enum LinkWarning {
 	SymNotFound(String),
+	RelocationIgnored(u64),
 }
 
 impl fmt::Display for LinkWarning {
@@ -41,6 +42,7 @@ impl fmt::Display for LinkWarning {
 		use LinkWarning::*;
 		match self {
 			SymNotFound(s) => write!(f, "symbol not found: {s}"),
+			RelocationIgnored(offset) => write!(f, "offset {offset} not in a data/text section. relocation will not be applied."),
 		}
 	}
 }
@@ -163,7 +165,7 @@ enum SymbolType {
 #[derive(Copy, Clone, Debug)]
 enum SymbolValue {
 	Bss(u64),
-	Data(u64), // index into Linker.data
+	Data(usize), // index into Linker.symbol_data
 	Absolute(u64),
 }
 
@@ -235,46 +237,54 @@ impl RelocationType {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // @TODO @TEMPORARY
 struct Relocation {
-	offset: u64,
+	data_idx: usize,
 	source_id: SourceId,
 	sym: SymbolName,
 	r#type: RelocationType,
 	addend: i64,
 }
 
-impl Relocation {
-	fn new_x86(
-		symtab: &HashMap<u32, SymbolName>,
-		source_id: SourceId,
-		offset: u64,
-		info: u32,
-		addend: i32,
-	) -> Result<Self, ElfError> {
-		let r#type = info as u8;
-		let sym_idx = info >> 8;
-		match symtab.get(&sym_idx) {
-			Some(sym) => Ok(Self {
-				offset,
-				source_id,
-				sym: *sym,
-				r#type: RelocationType::from_x86_u8(r#type)?,
-				addend: addend.into(),
-			}),
-			None => Err(ElfError::BadSymIdx(sym_idx.into())),
-		}
-	}
-}
-
 struct Linker {
 	strtab_offset: u64,
-	data: Vec<u8>, // contains all data from all objects.
 	source_count: u32,
 	symbols: Symbols,
 	symbol_names: SymbolNames,
 	relocations: Vec<Relocation>,
 	sections: Vec<elf::Shdr32>,
 	warnings: Vec<LinkWarning>,
+	symbol_data: Vec<u8>,
 	bss_size: u64,
+}
+
+// this maps between offsets in this object and indices in self.symbol_data.
+// (needed to translate relocation addresses to symbol_data offsets.)
+struct AddrMap {
+	map: BTreeMap<(u64, u64), usize>,
+}
+
+impl AddrMap {
+	fn new() -> Self {
+		AddrMap {
+			map: BTreeMap::new(),
+		}
+	}
+
+	fn add_symbol(&mut self, offset: u64, size: u64, data_idx: usize) {
+		if size > 0 {
+			self.map.insert((offset, offset + size), data_idx);
+		}
+	}
+
+	fn offset_to_data_idx(&self, offset: u64) -> Option<usize> {
+		let mut r = self.map.range(..(offset, u64::MAX));
+		let (key, value) = r.next_back()?;
+		if offset >= key.0 && offset < key.1 {
+			// offset corresponds to somewhere in this symbol
+			Some(*value + (offset - key.0) as usize)
+		} else {
+			None
+		}
+	}
 }
 
 impl Linker {
@@ -285,9 +295,9 @@ impl Linker {
 			source_count: 0,
 			strtab_offset: 0,
 			bss_size: 0,
-			data: vec![],
 			sections: vec![],
 			relocations: vec![],
+			symbol_data: vec![],
 			warnings: vec![],
 		}
 	}
@@ -304,7 +314,7 @@ impl Linker {
 	fn add_symbol(
 		&mut self,
 		source: SourceId,
-		source_offset: u64,
+		addr_map: &mut AddrMap,
 		reader: &mut BufReader<File>,
 	) -> Result<SymbolName, ElfError> {
 		#[repr(C)]
@@ -348,9 +358,16 @@ impl Linker {
 				let ndx = ndx as usize;
 				match self.get_str(reader, self.sections[ndx].name)?.as_str() {
 					".text" | ".data" | ".data1" | ".rodata" | ".rodata1" => {
-						Some(SymbolValue::Data(
-							source_offset + self.sections[ndx].offset as u64 + sym.value as u64,
-						))
+						// add to symbol_data
+						let data_idx = self.symbol_data.len();
+						let offset = self.sections[ndx].offset as u64 + sym.value as u64;
+
+						addr_map.add_symbol(offset, size, data_idx);
+
+						reader.seek(io::SeekFrom::Start(offset))?;
+						self.symbol_data.resize(data_idx + size as usize, 0);
+						reader.read_exact(&mut self.symbol_data[data_idx..])?;
+						Some(SymbolValue::Data(data_idx))
 					}
 					".bss" => {
 						let p = self.bss_size;
@@ -377,11 +394,43 @@ impl Linker {
 
 		Ok(name_id)
 	}
+	
+	fn add_relocation_x86(
+		&mut self,
+		symtab: &HashMap<u32, SymbolName>,
+		addr_map: &AddrMap,
+		source_id: SourceId,
+		offset: u64,
+		info: u32,
+		addend: i32,
+	) -> Result<(), ElfError> {
+		let r#type = info as u8;
+		let sym_idx = info >> 8;
+
+		if let Some(data_idx) = addr_map.offset_to_data_idx(offset) {
+			match symtab.get(&sym_idx) {
+				Some(sym) => {
+					self.relocations.push(Relocation {
+						data_idx,
+						source_id,
+						sym: *sym,
+						r#type: RelocationType::from_x86_u8(r#type)?,
+						addend: addend.into(),
+					});
+				},
+				None => return Err(ElfError::BadSymIdx(sym_idx.into())),
+			}
+		} else {
+			self.warnings.push(LinkWarning::RelocationIgnored(offset));
+		}
+		Ok(())
+	}
 
 	pub fn process_object(&mut self, reader: &mut BufReader<File>) -> Result<(), ElfError> {
 		use ElfError::*;
-		let source_offset = self.data.len() as u64;
-		reader.read_to_end(&mut self.data)?;
+
+		let mut addr_map = AddrMap::new();
+
 		reader.seek(io::SeekFrom::Start(0))?;
 
 		let source_id = SourceId(self.source_count);
@@ -443,7 +492,7 @@ impl Linker {
 			symtab.reserve(count as usize);
 			for sym_idx in 0..count {
 				reader.seek(io::SeekFrom::Start(offset + sym_idx as u64 * entsize))?;
-				let name = self.add_symbol(source_id, source_offset, reader)?;
+				let name = self.add_symbol(source_id, &mut addr_map, reader)?;
 				symtab.insert(sym_idx, name);
 			}
 		}
@@ -495,23 +544,22 @@ impl Linker {
 				Ok(relocations)
 			}
 
-			let info_section_offset = source_offset
-				+ self
-					.sections
-					.get(shdr.info as usize)
-					.ok_or(BadLink(shdr.info as u64))?
-					.offset as u64;
+			let info_section_offset = self
+				.sections
+				.get(shdr.info as usize)
+				.ok_or(BadLink(shdr.info as u64))?
+				.offset as u64;
 
 			let add_relocation_x86 =
 				|me: &mut Self, offset: u32, info: u32, addend: i32| -> Result<(), ElfError> {
-					me.relocations.push(Relocation::new_x86(
+					me.add_relocation_x86(
 						&symtab,
+						&addr_map,
 						source_id,
 						info_section_offset + offset as u64,
 						info,
 						addend,
-					)?);
-					Ok(())
+					)
 				};
 
 			const SHT_RELA: u32 = 4;
@@ -585,26 +633,38 @@ impl Linker {
 			self.apply_relocation(self.relocations[i].clone())?;
 		}
 
-		const SEGMENT_ADDR: u32 = 0x400000;
+		let segment_addr: u32 = 0x400000;
 
 		let data_size = 0;
 
 		let mut header = elf::Header32::default();
-		let header_size: u32 = header.ehsize.into();
+		let ehdr_size: u32 = header.ehsize.into();
 		let phdr_size: u32 = header.phentsize.into();
-		let file_size = header_size + phdr_size + data_size;
-		let entry_point = SEGMENT_ADDR + header_size + phdr_size;
+		let header_size = ehdr_size + phdr_size;
+		let file_size = header_size + data_size;
+		let entry_point = segment_addr + header_size;
 		header.phnum = 1;
-		header.phoff = header_size;
+		header.phoff = ehdr_size;
 		header.entry = entry_point;
 		out.write_all(&header.to_bytes())?;
-
+		
+		let data_addr = segment_addr + header_size;
+		let bss_addr = segment_addr + file_size;
 		let bss_size: u32 = self.bss_size.try_into().map_err(|_| LinkError::TooLarge)?;
+
+		let _get_symbol_value = |val: SymbolValue| -> u64 {
+			use SymbolValue::*;
+			match val {
+				Absolute(n) => n,
+				Bss(x) => bss_addr as u64 + x,
+				Data(d) => data_addr as u64 + d as u64,
+			}
+		};
 
 		let phdr = elf::Phdr32 {
 			flags: 0b111, // read, write, execute
 			offset: 0,
-			vaddr: SEGMENT_ADDR,
+			vaddr: segment_addr,
 			filesz: file_size,
 			memsz: file_size + bss_size,
 			..Default::default()
@@ -677,7 +737,10 @@ fn main() {
 		}
 	};
 
-	if let Err(e) = linker.link(&mut output) {
-		eprintln!("Error linking: {e}");
+	match linker.link(&mut output) {
+		Err(e) => eprintln!("Error linking: {e}"),
+		Ok(warnings) => for warning in warnings {
+				eprintln!("Warning: {warning}");
+			},
 	}
 }
