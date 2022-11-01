@@ -2,8 +2,42 @@
 
 use std::{io, mem};
 
+// executable type
 pub const ET_REL: u16 = 1;
 pub const ET_EXEC: u16 = 2;
+
+#[allow(unused)]
+pub const SHT_PROGBITS: u32 = 1; // Program data
+#[allow(unused)]
+pub const SHT_SYMTAB: u32 = 2; // Symbol table
+#[allow(unused)]
+pub const SHT_STRTAB: u32 = 3; // String table
+#[allow(unused)]
+pub const SHT_RELA: u32 = 4; // Relocation entries with addends
+#[allow(unused)]
+pub const SHT_HASH: u32 = 5; // Symbol hash table
+#[allow(unused)]
+pub const SHT_DYNAMIC: u32 = 6; // Dynamic linking information
+#[allow(unused)]
+pub const SHT_NOTE: u32 = 7; // Notes
+#[allow(unused)]
+pub const SHT_NOBITS: u32 = 8; // Program space with no data (bss)
+#[allow(unused)]
+pub const SHT_REL: u32 = 9; // Relocation entries, no addends
+
+// symbol type
+pub const STT_OBJECT: u8 = 1;
+pub const STT_FUNC: u8 = 2;
+
+// symbol bind
+pub const STB_LOCAL: u8 = 0;
+pub const STB_GLOBAL: u8 = 1;
+pub const STB_WEAK: u8 = 2;
+
+// section number (for relocations)
+pub const SHN_UNDEF: u16 = 0;
+pub const SHN_ABS: u16 = 0xfff1;
+pub const SHN_COMMON: u16 = 0xfff2;
 
 #[repr(C)]
 pub struct Header32 {

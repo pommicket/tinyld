@@ -8,6 +8,8 @@ mod elf;
 pub enum LinkError {
 	IO(io::Error),
 	TooLarge,
+	NoEntry(String), // no entry point
+	EntryNotDefined(String), // entry point is declared, but not defined
 }
 
 impl fmt::Display for LinkError {
@@ -16,6 +18,8 @@ impl fmt::Display for LinkError {
 		match self {
 			IO(e) => write!(f, "IO error: {e}"),
 			TooLarge => write!(f, "executable file would be too large."),
+			NoEntry(name) => write!(f, "entry point {name} not found."),
+			EntryNotDefined(name) => write!(f, "entry point {name} declared, but not defined."),
 		}
 	}
 }
@@ -42,7 +46,10 @@ impl fmt::Display for LinkWarning {
 		use LinkWarning::*;
 		match self {
 			SymNotFound(s) => write!(f, "symbol not found: {s}"),
-			RelocationIgnored(offset) => write!(f, "offset {offset} not in a data/text section. relocation will not be applied."),
+			RelocationIgnored(offset) => write!(
+				f,
+				"offset {offset} not in a data/text section. relocation will not be applied."
+			),
 		}
 	}
 }
@@ -155,6 +162,13 @@ impl SymbolNames {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 struct SourceId(u32);
 
+impl SourceId {
+	const NONE: Self = Self(u32::MAX);
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+struct SymbolId(u32);
+
 #[derive(Copy, Clone, Debug)]
 enum SymbolType {
 	Function,
@@ -162,10 +176,10 @@ enum SymbolType {
 	Other,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 enum SymbolValue {
 	Bss(u64),
-	Data(usize), // index into Linker.symbol_data
+	Data(Vec<u8>),
 	Absolute(u64),
 }
 
@@ -178,37 +192,61 @@ struct SymbolInfo {
 }
 
 struct Symbols {
-	global: HashMap<SymbolName, SymbolInfo>,
-	weak: HashMap<SymbolName, SymbolInfo>,
-	local: HashMap<(SourceId, SymbolName), SymbolInfo>,
+	info: Vec<SymbolInfo>,
+	global: HashMap<SymbolName, SymbolId>,
+	weak: HashMap<SymbolName, SymbolId>,
+	local: HashMap<(SourceId, SymbolName), SymbolId>,
 }
 
 impl Symbols {
 	fn new() -> Self {
 		Self {
+			info: vec![],
 			global: HashMap::new(),
 			weak: HashMap::new(),
 			local: HashMap::new(),
 		}
 	}
 
-	fn add_weak(&mut self, name: SymbolName, info: SymbolInfo) {
-		self.weak.insert(name, info);
+	fn add_(&mut self, info: SymbolInfo) -> SymbolId {
+		let id = SymbolId(self.info.len() as _);
+		self.info.push(info);
+		id
 	}
 
-	fn add_local(&mut self, source: SourceId, name: SymbolName, info: SymbolInfo) {
-		self.local.insert((source, name), info);
+	fn add_weak(&mut self, name: SymbolName, info: SymbolInfo) -> SymbolId {
+		let id = self.add_(info);
+		self.weak.insert(name, id);
+		id
 	}
 
-	fn add_global(&mut self, name: SymbolName, info: SymbolInfo) {
-		self.global.insert(name, info);
+	fn add_local(&mut self, source: SourceId, name: SymbolName, info: SymbolInfo) -> SymbolId {
+		let id = self.add_(info);
+		self.local.insert((source, name), id);
+		id
 	}
 
-	fn get(&self, source: SourceId, name: SymbolName) -> Option<&SymbolInfo> {
-		self.local
+	fn add_global(&mut self, name: SymbolName, info: SymbolInfo) -> SymbolId {
+		let id = self.add_(info);
+		self.global.insert(name, id);
+		id
+	}
+
+	fn get_info_from_id(&self, id: SymbolId) -> Option<&SymbolInfo> {
+		self.info.get(id.0 as usize)
+	}
+
+	fn get_id_from_name(&self, source: SourceId, name: SymbolName) -> Option<SymbolId> {
+		self
+			.local
 			.get(&(source, name))
 			.or_else(|| self.global.get(&name))
 			.or_else(|| self.weak.get(&name))
+			.map(|r| *r)
+	}
+	
+	fn get_info_from_name(&self, source: SourceId, name: SymbolName) -> Option<&SymbolInfo> {
+		self.get_info_from_id(self.get_id_from_name(source, name)?)
 	}
 }
 
@@ -237,7 +275,7 @@ impl RelocationType {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // @TODO @TEMPORARY
 struct Relocation {
-	data_idx: usize,
+	r#where: (SymbolId, u64), // (symbol containing relocation, offset in symbol where relocation needs to be applied)
 	source_id: SourceId,
 	sym: SymbolName,
 	r#type: RelocationType,
@@ -252,14 +290,13 @@ struct Linker {
 	relocations: Vec<Relocation>,
 	sections: Vec<elf::Shdr32>,
 	warnings: Vec<LinkWarning>,
-	symbol_data: Vec<u8>,
 	bss_size: u64,
 }
 
-// this maps between offsets in this object and indices in self.symbol_data.
-// (needed to translate relocation addresses to symbol_data offsets.)
+// this maps between offsets in an object file and symbols defined in that file.
+// this is used to figure out where relocations are taking place.
 struct AddrMap {
-	map: BTreeMap<(u64, u64), usize>,
+	map: BTreeMap<(u64, u64), SymbolId>,
 }
 
 impl AddrMap {
@@ -269,18 +306,20 @@ impl AddrMap {
 		}
 	}
 
-	fn add_symbol(&mut self, offset: u64, size: u64, data_idx: usize) {
+	fn add_symbol(&mut self, offset: u64, size: u64, id: SymbolId) {
 		if size > 0 {
-			self.map.insert((offset, offset + size), data_idx);
+			self.map.insert((offset, offset + size), id);
 		}
 	}
 
-	fn offset_to_data_idx(&self, offset: u64) -> Option<usize> {
+	// returns symbol, offset in symbol.
+	// e.g. a relocation might happen at main+0x33.
+	fn get(&self, offset: u64) -> Option<(SymbolId, u64)> {
 		let mut r = self.map.range(..(offset, u64::MAX));
 		let (key, value) = r.next_back()?;
 		if offset >= key.0 && offset < key.1 {
 			// offset corresponds to somewhere in this symbol
-			Some(*value + (offset - key.0) as usize)
+			Some((*value, offset - key.0))
 		} else {
 			None
 		}
@@ -297,7 +336,6 @@ impl Linker {
 			bss_size: 0,
 			sections: vec![],
 			relocations: vec![],
-			symbol_data: vec![],
 			warnings: vec![],
 		}
 	}
@@ -336,40 +374,29 @@ impl Linker {
 		let name_id = self.symbol_names.add(name);
 		let size = sym.size as u64;
 
-		const STT_OBJECT: u8 = 1;
-		const STT_FUNC: u8 = 2;
-		const STB_LOCAL: u8 = 0;
-		const STB_GLOBAL: u8 = 1;
-		const STB_WEAK: u8 = 2;
-		const SHN_UNDEF: u16 = 0;
-		const SHN_ABS: u16 = 0xfff1;
-		const SHN_COMMON: u16 = 0xfff2;
-
 		let r#type = match r#type {
-			STT_OBJECT => SymbolType::Object,
-			STT_FUNC => SymbolType::Function,
+			elf::STT_OBJECT => SymbolType::Object,
+			elf::STT_FUNC => SymbolType::Function,
 			_ => SymbolType::Other,
 		};
 
+		let mut data_offset = None;
+
 		let value = match sym.shndx {
-			SHN_UNDEF | SHN_COMMON => None,
-			SHN_ABS => Some(SymbolValue::Absolute(sym.value as u64)),
+			elf::SHN_UNDEF | elf::SHN_COMMON => None,
+			elf::SHN_ABS => Some(SymbolValue::Absolute(sym.value as u64)),
 			ndx if (ndx as usize) < self.sections.len() => {
 				let ndx = ndx as usize;
-				match self.get_str(reader, self.sections[ndx].name)?.as_str() {
-					".text" | ".data" | ".data1" | ".rodata" | ".rodata1" => {
-						// add to symbol_data
-						let data_idx = self.symbol_data.len();
+				match self.sections[ndx].r#type {
+					elf::SHT_PROGBITS => {
 						let offset = self.sections[ndx].offset as u64 + sym.value as u64;
-
-						addr_map.add_symbol(offset, size, data_idx);
-
+						data_offset = Some(offset);
 						reader.seek(io::SeekFrom::Start(offset))?;
-						self.symbol_data.resize(data_idx + size as usize, 0);
-						reader.read_exact(&mut self.symbol_data[data_idx..])?;
-						Some(SymbolValue::Data(data_idx))
+						let mut data = vec![0; size as usize];
+						reader.read_exact(&mut data)?;
+						Some(SymbolValue::Data(data))
 					}
-					".bss" => {
+					elf::SHT_NOBITS => {
 						let p = self.bss_size;
 						self.bss_size += size;
 						Some(SymbolValue::Bss(p))
@@ -385,16 +412,19 @@ impl Linker {
 			value,
 			size,
 		};
-		match bind {
-			STB_LOCAL => self.symbols.add_local(source, name_id, info),
-			STB_GLOBAL => self.symbols.add_global(name_id, info),
-			STB_WEAK => self.symbols.add_weak(name_id, info),
-			_ => {}
-		}
+		let symbol_id = match bind {
+			elf::STB_LOCAL => self.symbols.add_local(source, name_id, info),
+			elf::STB_GLOBAL => self.symbols.add_global(name_id, info),
+			elf::STB_WEAK => self.symbols.add_weak(name_id, info),
+			_ => return Ok(name_id),
+		};
 
+		if let Some(offset) = data_offset {
+			addr_map.add_symbol(offset, size, symbol_id);
+		}
 		Ok(name_id)
 	}
-	
+
 	fn add_relocation_x86(
 		&mut self,
 		symtab: &HashMap<u32, SymbolName>,
@@ -407,17 +437,17 @@ impl Linker {
 		let r#type = info as u8;
 		let sym_idx = info >> 8;
 
-		if let Some(data_idx) = addr_map.offset_to_data_idx(offset) {
+		if let Some(r#where) = addr_map.get(offset) {
 			match symtab.get(&sym_idx) {
 				Some(sym) => {
 					self.relocations.push(Relocation {
-						data_idx,
+						r#where,
 						source_id,
 						sym: *sym,
 						r#type: RelocationType::from_x86_u8(r#type)?,
 						addend: addend.into(),
 					});
-				},
+				}
 				None => return Err(ElfError::BadSymIdx(sym_idx.into())),
 			}
 		} else {
@@ -562,10 +592,8 @@ impl Linker {
 					)
 				};
 
-			const SHT_RELA: u32 = 4;
-			const SHT_REL: u32 = 9;
 			match shdr.r#type {
-				SHT_RELA => {
+				elf::SHT_RELA => {
 					#[repr(C)]
 					struct ElfRela {
 						offset: u32,
@@ -582,7 +610,7 @@ impl Linker {
 						)?;
 					}
 				}
-				SHT_REL => {
+				elf::SHT_REL => {
 					#[repr(C)]
 					struct ElfRel {
 						offset: u32,
@@ -600,15 +628,15 @@ impl Linker {
 		Ok(())
 	}
 
-	fn get_sym_name(&self, id: SymbolName) -> Option<&str> {
+	fn get_name_str(&self, id: SymbolName) -> Option<&str> {
 		self.symbol_names.get_str(id)
 	}
 
 	// get symbol, producing a warning if it does not exist.
-	fn get_symbol(&mut self, source_id: SourceId, id: SymbolName) -> Option<&SymbolInfo> {
-		let sym = self.symbols.get(source_id, id);
+	fn get_symbol(&mut self, source_id: SourceId, name: SymbolName) -> Option<&SymbolInfo> {
+		let sym = self.symbols.get_info_from_name(source_id, name);
 		if sym.is_none() {
-			let warn = LinkWarning::SymNotFound(self.get_sym_name(id).unwrap_or("???").into());
+			let warn = LinkWarning::SymNotFound(self.get_name_str(name).unwrap_or("???").into());
 			self.warnings.push(warn);
 		}
 		sym
@@ -620,6 +648,22 @@ impl Linker {
 			Some(sym) => sym,
 		};
 		println!("{rel:?} {symbol:?}");
+		Ok(())
+	}
+	
+	// we don't want to link unused symbols.
+	// we start by calling this on the entry function, then it recursively calls itself for each symbol used.
+	pub fn add_data_for_symbol(&mut self, data: &mut Vec<u8>, symbol_graph: &HashMap<SymbolId, Vec<SymbolId>>,
+		symbol_addrs: &mut HashMap<SymbolId, u64>, id: SymbolId) -> Result<(), LinkError> {
+		// deal with cycles
+		if symbol_addrs.contains_key(&id) {
+			return Ok(());
+		}
+		symbol_addrs.insert(id, data.len() as u64);
+		for reference in symbol_graph.get(&id).unwrap_or(&vec![]) {
+			self.add_data_for_symbol(data, symbol_graph, symbol_addrs, *reference)?;
+		}
+		
 		Ok(())
 	}
 
@@ -647,19 +691,26 @@ impl Linker {
 		header.phoff = ehdr_size;
 		header.entry = entry_point;
 		out.write_all(&header.to_bytes())?;
-		
-		let data_addr = segment_addr + header_size;
-		let bss_addr = segment_addr + file_size;
-		let bss_size: u32 = self.bss_size.try_into().map_err(|_| LinkError::TooLarge)?;
 
-		let _get_symbol_value = |val: SymbolValue| -> u64 {
-			use SymbolValue::*;
-			match val {
-				Absolute(n) => n,
-				Bss(x) => bss_addr as u64 + x,
-				Data(d) => data_addr as u64 + d as u64,
-			}
-		};
+		//let data_addr = segment_addr + header_size;
+		//let bss_addr = segment_addr + file_size;
+		let bss_size: u32 = self.bss_size.try_into().map_err(|_| LinkError::TooLarge)?;
+		
+		let entry_name_str = "entry";
+		let entry_name_id = self.symbol_names.get(entry_name_str).ok_or_else(|| LinkError::NoEntry(entry_name_str.into()))?;
+		let entry_id = self.symbols.get_id_from_name(SourceId::NONE, entry_name_id).ok_or_else(|| LinkError::EntryNotDefined(entry_name_str.into()))?;
+		let mut symbol_addrs = HashMap::new();
+		
+		self.add_data_for_symbol(&mut symbol_addrs, entry_id);
+// 		
+// 		let _get_symbol_value = |val: SymbolValue| -> u64 {
+// 			use SymbolValue::*;
+// 			match val {
+// 				Absolute(n) => n,
+// 				Bss(x) => bss_addr as u64 + x,
+// 				Data(_d) => todo!(),
+// 			}
+// 		};
 
 		let phdr = elf::Phdr32 {
 			flags: 0b111, // read, write, execute
@@ -739,8 +790,10 @@ fn main() {
 
 	match linker.link(&mut output) {
 		Err(e) => eprintln!("Error linking: {e}"),
-		Ok(warnings) => for warning in warnings {
+		Ok(warnings) => {
+			for warning in warnings {
 				eprintln!("Warning: {warning}");
-			},
+			}
+		}
 	}
 }
