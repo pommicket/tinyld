@@ -18,6 +18,8 @@ pub enum LinkError {
 	EntryNotDefined(String), // entry point is declared, but not defined
 }
 
+type LinkResult<T> = Result<T, LinkError>;
+
 impl fmt::Display for LinkError {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		use LinkError::*;
@@ -206,10 +208,6 @@ struct SymbolInfo {
 
 struct Symbols {
 	info: Vec<SymbolInfo>,
-	// this field isn't strictly needed for linking,
-	// but it lets us print nice error messages like
-	//   error linking main.c:some_function instead of
-	//   error linking symbol 387
 	locations: HashMap<SymbolId, (SourceId, SymbolName)>,
 	global: HashMap<SymbolName, SymbolId>,
 	weak: HashMap<SymbolName, SymbolId>,
@@ -271,7 +269,7 @@ impl Symbols {
 	fn get_location_from_id(&self, id: SymbolId) -> Option<(SourceId, SymbolName)> {
 		self.locations.get(&id).map(|r| *r)
 	}
-
+	
 	fn count(&self) -> usize {
 		self.info.len()
 	}
@@ -310,7 +308,6 @@ struct Linker {
 	symbols: Symbols,
 	symbol_names: SymbolNames,
 	relocations: Vec<Relocation>,
-	undefined_relocations: Vec<Relocation>, // stuff from libc, etc.
 	sections: Vec<elf::Shdr32>,
 	sources: Vec<String>,
 	bss_size: u64,                        // output bss size
@@ -359,6 +356,205 @@ type SymbolGraph = HashMap<SymbolId, Vec<SymbolId>>;
 
 const MAX_REL_SIZE: usize = 8; // this seems reasonable
 
+struct Executable {
+	interp: Vec<u8>,
+	load_addr: u64,
+	bss: Option<(u64, u64)>,
+	relocations: Vec<Relocation>,
+	strtab: Vec<u8>,
+	symbol_strtab_offsets: HashMap<SymbolName, u64>,
+	lib_strtab_offsets: Vec<u64>,
+}
+
+impl Executable {
+	pub fn new(load_addr: u64) -> Self {
+		Self {
+			bss: None,
+			load_addr,
+			interp: vec![],
+			relocations: vec![],
+			lib_strtab_offsets: vec![],
+			symbol_strtab_offsets: HashMap::new(),
+			strtab: vec![0],
+		}
+	}
+	
+	pub fn set_bss(&mut self, addr: u64, size: u64) {
+		self.bss = Some((addr, size));
+	}
+	
+	pub fn set_interp(&mut self, interp: &str) {
+		self.interp = interp.as_bytes().into();
+		self.interp.push(b'\0');
+	}
+	
+	
+	fn add_string(&mut self, s: &str) -> u64 {
+		let ret = self.strtab.len() as u64;
+		self.strtab.extend(s.as_bytes());
+		self.strtab.push(b'\0');
+		ret
+	}
+	
+	pub fn add_lib(&mut self, lib: &str) {
+		let s = self.add_string(lib);
+		self.lib_strtab_offsets.push(s);
+	}
+	
+	pub fn add_relocation(&mut self, symbol_names: &SymbolNames, rel: &Relocation) {
+		let name = rel.sym;
+		
+		if self.symbol_strtab_offsets.get(&name).is_none() {
+			let s = symbol_names.get_str(name).unwrap();
+			let offset = self.add_string(s);
+			self.symbol_strtab_offsets.insert(name, offset);
+		}
+		self.relocations.push(rel.clone());
+	}
+	
+	fn segment_count(&self) -> u16 {
+		let mut count = 1 /*data*/;
+		if !self.interp.is_empty() {
+			count += 2 /*interp,dyntab*/;
+		}
+		if self.bss.is_some() {
+			count += 1 /*bss*/;
+		}
+		count
+	}
+	
+	fn ph_offset(&self) -> u64 {
+		elf::Ehdr32::size_of() as u64
+	}
+	
+	fn ph_size(&self) -> u64 {
+		elf::Phdr32::size_of() as u64 * u64::from(self.segment_count())
+	}
+	
+	fn data_offset(&self) -> u64 {
+		self.ph_offset() + self.ph_size()
+	}
+	
+	pub fn data_addr(&self) -> u64 {
+		self.load_addr + self.data_offset()
+	}
+	
+	pub fn write<T: Write + Seek>(&self, data: &[u8], out: &mut T) -> LinkResult<()> {
+		let load_addr = 0x400000;// @TODO: make field
+		let data_addr: u32 = self.data_addr() as u32;
+		
+		// start by writing data.
+		out.seek(io::SeekFrom::Start(self.data_offset()))?;
+		out.write_all(data)?;
+		
+		let mut interp_offset = 0;
+		let mut dyntab_offset = 0;
+		let mut interp_size = 0;
+		let mut dyntab_size = 0;
+		if !self.interp.is_empty() {
+			// now interp
+			interp_offset = out.stream_position()?;
+			out.write_all(&self.interp)?;
+			interp_size = self.interp.len() as u32;
+			// now strtab
+			let strtab_offset = out.stream_position()?;
+			out.write_all(&self.strtab)?;
+			// now symtab
+			let symtab_offset = out.stream_position()?;
+			// now reltab
+			let reltab_offset = out.stream_position()?;
+			let reltab_size = out.stream_position()? - reltab_offset;
+			// now hash
+			let hashtab_offset = out.stream_position()?;
+			// now dyntab
+			dyntab_offset = out.stream_position()?;
+			let mut dyn_data = vec![
+				elf::DT_RELSZ, reltab_size as u32,
+				elf::DT_RELENT, 8,
+				elf::DT_REL, reltab_offset as u32,
+				elf::DT_STRSZ, self.strtab.len() as u32,
+				elf::DT_STRTAB, strtab_offset as u32,
+				elf::DT_SYMENT, 16,
+				elf::DT_SYMTAB, symtab_offset as u32,
+				elf::DT_HASH, hashtab_offset as u32,
+			];
+			for lib in &self.lib_strtab_offsets {
+				dyn_data.extend([elf::DT_NEEDED, *lib as u32]);
+			}
+			let mut dyn_bytes = Vec::with_capacity(dyn_data.len() * 4);
+			for x in dyn_data {
+				dyn_bytes.extend(u32::to_le_bytes(x));
+			}
+			dyntab_size = dyn_bytes.len() as u32;
+			out.write_all(&dyn_bytes)?;
+		}
+		
+		let file_size: u32 = out.stream_position()?.try_into().map_err(|_| LinkError::TooLarge)?;
+		
+		out.seek(io::SeekFrom::Start(0))?;
+		
+		let mut ehdr = elf::Ehdr32::default();
+		ehdr.phnum = self.segment_count();
+		ehdr.phoff = elf::Ehdr32::size_of() as u32;
+		ehdr.entry = self.data_offset().try_into().map_err(|_| LinkError::TooLarge)?;
+		out.write_all(&ehdr.to_bytes())?;
+		
+		let phdr_data = elf::Phdr32 {
+			flags: elf::PF_R | elf::PF_W | elf::PF_X, // read, write, execute
+			offset: 0,
+			vaddr: data_addr,
+			filesz: file_size,
+			memsz: file_size,
+			..Default::default()
+		};
+		out.write_all(&phdr_data.to_bytes())?;
+		
+		if let Some((bss_addr, bss_size)) = self.bss {
+			// for some reason, linux doesn't like executables
+			// with memsz > filesz != 0
+			// so we need two segments.
+			let bss_size: u32 = bss_size.try_into().map_err(|_| LinkError::TooLarge)?;
+			let phdr_bss = elf::Phdr32 {
+				flags: elf::PF_R | elf::PF_W, // read, write
+				offset: 0,
+				vaddr: bss_addr as u32,
+				filesz: 0,
+				memsz: bss_size as u32,
+				..Default::default()
+			};
+			out.write_all(&phdr_bss.to_bytes())?;
+		}
+		
+		if !self.interp.is_empty() {
+			let phdr_interp = elf::Phdr32 {
+				r#type: elf::PT_INTERP,
+				flags: elf::PF_R,
+				offset: interp_offset as u32,
+				vaddr: load_addr + interp_offset as u32,
+				filesz: interp_size as u32,
+				memsz: interp_size as u32,
+				align: 1,
+				..Default::default()
+			};
+			out.write_all(&phdr_interp.to_bytes())?;
+			
+			let phdr_dynamic = elf::Phdr32 {
+				r#type: elf::PT_DYNAMIC,
+				flags: elf::PF_R,
+				offset: dyntab_offset as u32,
+				vaddr: load_addr + dyntab_offset as u32,
+				filesz: dyntab_size as u32,
+				memsz: dyntab_size as u32,
+				align: 1,
+				..Default::default()
+			};
+			out.write_all(&phdr_dynamic.to_bytes())?;
+		}
+		
+		Ok(())
+	}
+}
+
 impl Linker {
 	fn default_warn_handler(warning: LinkWarning) {
 		eprintln!("warning: {warning}");
@@ -385,7 +581,6 @@ impl Linker {
 			sections: vec![],
 			relocations: vec![],
 			sources: vec![],
-			undefined_relocations: vec![],
 			symbol_data_offsets: HashMap::new(),
 			warn: Self::default_warn_handler,
 		}
@@ -760,19 +955,17 @@ impl Linker {
 		rel: &Relocation,
 		pc: u64,
 		data: &mut [u8; MAX_REL_SIZE],
-	) -> Result<usize, LinkError> {
-		//		use RelocationType::*;
-
+	) -> Result<Option<usize>, LinkError> {
 		let symbol = match self.get_symbol_id(rel.source_id, rel.sym) {
-			None => return Ok(0), // we emitted a warning in get_symbol_id
+			None => return Ok(Some(0)), // we emitted a warning in get_symbol_id
 			Some(sym) => sym,
 		};
 
 		let symbol_value = match self.get_symbol_value(symbol) {
 			None => {
-				self.undefined_relocations.push(rel.clone());
+				// this symbol is defined in a library
 				//self.emit_warning(LinkWarning::RelNoValue(self.symbol_id_location_string(symbol)));
-				return Ok(0)
+				return Ok(None)
 			},
 			Some(v) => v,
 		};
@@ -793,7 +986,7 @@ impl Linker {
 		match value {
 			U32(u) => {
 				(&mut data[..4]).copy_from_slice(&u32::to_le_bytes(u));
-				Ok(4)
+				Ok(Some(4))
 			},
 		}
 	}
@@ -808,6 +1001,11 @@ impl Linker {
 
 		let mut rel_data = [0; MAX_REL_SIZE];
 		let rel_data_size = self.get_relocation_data(&rel, apply_addr, &mut rel_data)?;
+		let rel_data_size = match rel_data_size {
+			None => return Ok(()), // defined in a library
+			Some(s) => s,
+		};
+		
 		let rel_data = &rel_data[..rel_data_size];
 
 		let apply_symbol_info = match self.symbols.get_mut_info_from_id(apply_symbol) {
@@ -882,8 +1080,8 @@ impl Linker {
 
 		Ok(())
 	}
-
-	pub fn link<T: Write + Seek>(&mut self, out: &mut BufWriter<T>) -> Result<(), LinkError> {
+	
+	pub fn link<T: Write + Seek>(&mut self, out: &mut BufWriter<T>) -> LinkResult<()> {
 		let mut symbol_graph = SymbolGraph::with_capacity(self.symbols.count());
 
 		let relocations = mem::take(&mut self.relocations);
@@ -906,94 +1104,20 @@ impl Linker {
 
 		let symbol_graph = symbol_graph; // no more mutating
 
-		let segment_addr: u32 = 0x400000;
-
-		let mut ehdr = elf::Ehdr32::default();
-		let ehdr_size: u32 = ehdr.ehsize.into();
-		let phdr_size: u32 = ehdr.phentsize.into();
-		let num_segments: u16 = 4; // interp, dynamic, data, bss
+		let mut exec = Executable::new(0x400000);
+		self.bss_addr = 0x50000000;
+		exec.set_bss(self.bss_addr, self.bss_size);
+		exec.set_interp("/lib/ld-linux.so.2");
+		exec.add_lib("libc.so.6");
 		
-		let header_size = ehdr_size + phdr_size * u32::from(num_segments);
-		let interp_offset = header_size;
-		let interp = "/lib/ld-linux.so.2\0";
-		let interp_size = interp.len() as u32;
-		let nlibs = 1;
-		let dynamic_offset = interp_offset + interp_size;
-		let dynamic_size = 16 * 4 + nlibs * 8;
-		let bss_addr: u32 = 0x9000000;
-		self.bss_addr = bss_addr.into();
-		let bss_size: u32 = self.bss_size.try_into().map_err(|_| LinkError::TooLarge)?;
-		
-		ehdr.phnum = num_segments;
-		ehdr.phoff = ehdr_size;
-		let ehdr = ehdr;
-		let entry_point_offset = ehdr.offsetof_entry();
-		out.write_all(&ehdr.to_bytes())?;
-
-		let phdr_interp = elf::Phdr32 {
-			r#type: elf::PT_INTERP,
-			flags: elf::PF_R,
-			offset: interp_offset,
-			vaddr: segment_addr + interp_offset,
-			filesz: interp_size,
-			memsz: interp_size,
-			align: 1,
-			..Default::default()
-		};
-
-		let phdr_dynamic = elf::Phdr32 {
-			r#type: elf::PT_DYNAMIC,
-			flags: elf::PF_R,
-			offset: dynamic_offset,
-			vaddr: segment_addr + dynamic_offset,
-			filesz: dynamic_size,
-			memsz: dynamic_size,
-			align: 1,
-			..Default::default()
-		};
-				
-		// for some reason, linux doesn't like executables
-		// with memsz > filesz != 0
-		// so we need two segments.
-		let phdr_data = elf::Phdr32 {..Default::default() };
-		let phdr_bss = elf::Phdr32 {
-			flags: elf::PF_R | elf::PF_W, // read, write
-			offset: 0,
-			vaddr: bss_addr,
-			filesz: 0,
-			memsz: bss_size,
-			..Default::default()
-		};
-		out.write_all(&phdr_interp.to_bytes())?;
-		out.write_all(&phdr_dynamic.to_bytes())?;
-		let dyn_data = vec![
-			elf::DT_RELSZ, 0,
-			elf::DT_RELENT, 0,
-			elf::DT_REL, 0,
-			elf::DT_STRSZ, 0,
-			elf::DT_STRTAB, 0,
-			elf::DT_SYMENT, 0,
-			elf::DT_SYMTAB, 0,
-			elf::DT_HASH, 0,
-			elf::DT_NEEDED, 0,
-		];
-		let mut dyn_bytes = Vec::with_capacity(dyn_data.len() * 4);
-		for x in dyn_data {
-			dyn_bytes.extend(u32::to_le_bytes(x));
+		for rel in relocations.iter() {
+			let mut _data = [0; MAX_REL_SIZE];
+			if self.get_relocation_data(rel, 0, &mut _data)?.is_none() {
+				exec.add_relocation(&self.symbol_names, rel);
+			}
 		}
 		
-		let phdr_data_offset = out.stream_position()?;
-		out.write_all(&phdr_data.to_bytes())?;
-		out.write_all(&phdr_bss.to_bytes())?;
-		out.write_all(interp.as_bytes())?;
-		out.write_all(&dyn_bytes)?;
-		
-		
-		let data_addr: u32 = out.stream_position()? as u32 + segment_addr;
-		self.data_addr = data_addr.into();
-		
-		out.seek(io::SeekFrom::End(0))?;
-		
+		self.data_addr = exec.data_addr();
 
 		let entry_name_str = "main";
 		let entry_name_id = self
@@ -1012,28 +1136,7 @@ impl Linker {
 			self.apply_relocation(rel, &mut data)?;
 		}
 		
-		out.write_all(&data)?;
-
-		let file_size = out.stream_position()?.try_into()
-			.map_err(|_| LinkError::TooLarge)?;
-		let entry_point = data_addr; // the entry point is the first thing we output data for
-
-		out.seek(io::SeekFrom::Start(entry_point_offset as u64))?;
-		out.write_all(&entry_point.to_le_bytes())?;
-		
-		let phdr_data = elf::Phdr32 {
-			flags: elf::PF_R | elf::PF_W | elf::PF_X, // read, write, execute
-			offset: 0,
-			vaddr: data_addr,
-			filesz: file_size,
-			memsz: file_size,
-			..Default::default()
-		};
-		
-		out.seek(io::SeekFrom::Start(phdr_data_offset))?;
-		out.write_all(&phdr_data.to_bytes())?;
-
-		Ok(())
+		exec.write(&data, out)
 	}
 }
 

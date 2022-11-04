@@ -112,8 +112,8 @@ impl Default for Ehdr32 {
 }
 
 impl Ehdr32 {
-	pub fn offsetof_entry(&self) -> usize {
-		0x18
+	pub fn size_of() -> usize {
+		mem::size_of::<Self>()
 	}
 	
 	pub fn section_offset(&self, ndx: u16) -> u64 {
@@ -172,6 +172,10 @@ impl Default for Phdr32 {
 }
 
 impl Phdr32 {
+	pub fn size_of() -> usize {
+		mem::size_of::<Self>()
+	}
+	
 	pub fn to_bytes(self) -> [u8; 0x20] {
 		unsafe { mem::transmute(self) }
 	}
