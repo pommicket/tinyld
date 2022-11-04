@@ -2,6 +2,14 @@
 
 use std::{io, mem};
 
+pub trait ToBytes<const N: usize> {
+	fn to_bytes(self) -> [u8; N];
+}
+
+pub trait FromBytes<const N: usize> {
+	fn from_bytes(bytes: [u8; N]) -> Self;
+}
+
 // executable type
 pub const ET_REL: u16 = 1;
 pub const ET_EXEC: u16 = 2;
@@ -13,7 +21,7 @@ pub const PF_X: u32 = 1 << 0;
 pub const PF_W: u32 = 1 << 1;
 pub const PF_R: u32 = 1 << 2;
 
-
+pub const DT_NULL: u32 = 0;
 pub const DT_NEEDED: u32 = 1;
 pub const DT_HASH: u32 = 4;
 pub const DT_STRTAB: u32 = 5;
@@ -123,10 +131,6 @@ impl Ehdr32 {
 	pub fn section_seek(&self, ndx: u16) -> io::SeekFrom {
 		io::SeekFrom::Start(self.section_offset(ndx))
 	}
-
-	pub fn to_bytes(self) -> [u8; 0x34] {
-		unsafe { mem::transmute(self) }
-	}
 }
 
 #[repr(C)]
@@ -175,8 +179,50 @@ impl Phdr32 {
 	pub fn size_of() -> usize {
 		mem::size_of::<Self>()
 	}
-	
-	pub fn to_bytes(self) -> [u8; 0x20] {
-		unsafe { mem::transmute(self) }
+}
+
+#[repr(C)]
+pub struct Sym32 {
+	pub name: u32,
+	pub value: u32,
+	pub size: u32,
+	pub info: u8,
+	pub other: u8,
+	pub shndx: u16,
+}
+
+#[repr(C)]
+pub struct Rela32 {
+	pub offset: u32,
+	pub info: u32,
+	pub addend: i32,
+}
+
+#[repr(C)]
+pub struct Rel32 {
+	pub offset: u32,
+	pub info: u32,
+}
+
+macro_rules! impl_bytes {
+	($r#type: ident, $n: literal) => {
+		impl FromBytes<$n> for $r#type {
+			fn from_bytes(bytes: [u8; $n]) -> Self {
+				unsafe { mem::transmute(bytes) }
+			}
+		}
+			
+		impl ToBytes<$n> for $r#type {
+			fn to_bytes(self) -> [u8; $n] {
+				unsafe { mem::transmute(self) }
+			}
+		}
+		
 	}
 }
+
+impl_bytes!(Ehdr32, 0x34);
+impl_bytes!(Phdr32, 0x20);
+impl_bytes!(Sym32, 16);
+impl_bytes!(Rela32, 12);
+impl_bytes!(Rel32, 8);

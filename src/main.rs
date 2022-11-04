@@ -10,6 +10,7 @@ use std::{fmt, fs, io, mem, ptr};
 compile_error! {"WHY do you have a big endian machine???? it's the 21st century, buddy. this program won't work fuck you"}
 
 mod elf;
+use elf::{FromBytes, ToBytes};
 
 pub enum LinkError {
 	IO(io::Error),
@@ -290,6 +291,14 @@ impl RelocationType {
 			_ => return Err(ElfError::UnsupportedRelocation(id)),
 		})
 	}
+	
+	fn to_x86_u8(self) -> u8 {
+		use RelocationType::*;
+		match self {
+			Direct32 => 1,
+			Pc32 => 2,
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -440,7 +449,7 @@ impl Executable {
 	}
 	
 	pub fn write<T: Write + Seek>(&self, data: &[u8], out: &mut T) -> LinkResult<()> {
-		let load_addr = 0x400000;// @TODO: make field
+		let load_addr = self.load_addr as u32;
 		let data_addr: u32 = self.data_addr() as u32;
 		
 		// start by writing data.
@@ -461,26 +470,67 @@ impl Executable {
 			out.write_all(&self.strtab)?;
 			// now symtab
 			let symtab_offset = out.stream_position()?;
+			let null_symbol = [0; mem::size_of::<elf::Sym32>()];
+			out.write_all(&null_symbol)?;
+			let mut symbols: HashMap<SymbolName, u32> = HashMap::new();
+			for (i, (sym, strtab_offset)) in self.symbol_strtab_offsets.iter().enumerate() {
+				symbols.insert(*sym, (i + 1) as u32);
+				// @TODO: allow STT_OBJECT as fell
+				let sym = elf::Sym32 {
+					name: *strtab_offset as u32,
+					info: elf::STB_GLOBAL << 4 | elf::STT_FUNC,
+					value: 0,
+					size: 0,
+					other: 0,
+					shndx: 0,
+				};
+				out.write_all(&sym.to_bytes())?;
+			}
 			// now reltab
 			let reltab_offset = out.stream_position()?;
+			for reloc in self.relocations.iter() {
+				let index = *symbols.get(&reloc.sym).unwrap();
+				println!("{:x}", index << 8 | u32::from(reloc.r#type.to_x86_u8()));
+				let rel = elf::Rel32 {
+					offset: load_addr, // @TODO
+					info: index << 8 | u32::from(reloc.r#type.to_x86_u8()),
+				};
+				out.write_all(&rel.to_bytes())?;
+			}
 			let reltab_size = out.stream_position()? - reltab_offset;
 			// now hash
 			let hashtab_offset = out.stream_position()?;
+			// put everything in a single bucket
+			let nsymbols = symbols.len() as u32;
+			out.write_all(&u32::to_le_bytes(1))?;
+			out.write_all(&u32::to_le_bytes(nsymbols))?;
+			out.write_all(&u32::to_le_bytes(0))?; // bucket begins at 0
+			// chain 1 -> 2 -> 3 -> ... -> n -> 0
+			for i in 1..nsymbols {
+				out.write_all(&u32::to_le_bytes(i))?;
+			}
+			// @OPTIMIZE: can be removed with potentially disastrous results if
+			// a symbol is not found.
+			out.write_all(&u32::to_le_bytes(0))?;
+			
+			
+			
 			// now dyntab
 			dyntab_offset = out.stream_position()?;
 			let mut dyn_data = vec![
 				elf::DT_RELSZ, reltab_size as u32,
 				elf::DT_RELENT, 8,
-				elf::DT_REL, reltab_offset as u32,
+				elf::DT_REL, load_addr + reltab_offset as u32,
 				elf::DT_STRSZ, self.strtab.len() as u32,
-				elf::DT_STRTAB, strtab_offset as u32,
+				elf::DT_STRTAB, load_addr + strtab_offset as u32,
 				elf::DT_SYMENT, 16,
-				elf::DT_SYMTAB, symtab_offset as u32,
-				elf::DT_HASH, hashtab_offset as u32,
+				elf::DT_SYMTAB, load_addr + symtab_offset as u32,
+				elf::DT_HASH, load_addr + hashtab_offset as u32,
 			];
 			for lib in &self.lib_strtab_offsets {
 				dyn_data.extend([elf::DT_NEEDED, *lib as u32]);
 			}
+			dyn_data.extend([elf::DT_NULL, 0]);
 			let mut dyn_bytes = Vec::with_capacity(dyn_data.len() * 4);
 			for x in dyn_data {
 				dyn_bytes.extend(u32::to_le_bytes(x));
@@ -615,19 +665,9 @@ impl Linker {
 		addr_map: &mut AddrMap,
 		reader: &mut BufReader<File>,
 	) -> Result<SymbolName, ElfError> {
-		#[repr(C)]
-		pub struct ElfSym {
-			name: u32,
-			value: u32,
-			size: u32,
-			info: u8,
-			other: u8,
-			shndx: u16,
-		}
-
 		let mut sym_buf = [0u8; 16];
 		reader.read_exact(&mut sym_buf)?;
-		let sym: ElfSym = unsafe { mem::transmute(sym_buf) };
+		let sym = elf::Sym32::from_bytes(sym_buf);
 		let r#type = sym.info & 0xf;
 		let bind = sym.info >> 4;
 		let name = self.get_strtab(reader, sym.name)?;
@@ -812,7 +852,7 @@ impl Linker {
 				}
 			}
 
-			fn read_relocations<RelType>(
+			fn read_relocations<const N: usize, RelType: FromBytes<N> + ToBytes<N>>(
 				reader: &mut BufReader<File>,
 				shdr: &elf::Shdr32,
 			) -> Result<Vec<RelType>, ElfError> {
@@ -824,19 +864,16 @@ impl Linker {
 				}
 				let count = size / entsize;
 				let mut relocations = Vec::with_capacity(count as _);
-				// annoyingly, array sizes can't depend on the size of a type parameter.
-				// if they could, we could just use transmute and everyone would be happier.
-				let mut rel_buf = [0; 32];
-				let rel_data = &mut rel_buf[..mem::size_of::<RelType>()];
+				let mut rel_buf = [0; N];
 
 				for rel_idx in 0..count {
 					reader.seek(io::SeekFrom::Start(offset + rel_idx * entsize))?;
 
-					reader.read_exact(rel_data)?;
+					reader.read_exact(&mut rel_buf)?;
 					let mut rel = mem::MaybeUninit::uninit();
 					let rel = unsafe {
 						ptr::copy_nonoverlapping(
-							(&rel_data[0]) as *const u8,
+							(&rel_buf[0]) as *const u8,
 							rel.as_mut_ptr() as *mut u8,
 							mem::size_of::<RelType>(),
 						);
@@ -868,13 +905,7 @@ impl Linker {
 
 			match shdr.r#type {
 				elf::SHT_RELA => {
-					#[repr(C)]
-					struct ElfRela {
-						offset: u32,
-						info: u32,
-						addend: i32,
-					}
-					let rels: Vec<ElfRela> = read_relocations(reader, shdr)?;
+					let rels: Vec<elf::Rela32> = read_relocations(reader, shdr)?;
 					for rela in rels {
 						add_relocation_x86(
 							self,
@@ -885,12 +916,7 @@ impl Linker {
 					}
 				}
 				elf::SHT_REL => {
-					#[repr(C)]
-					struct ElfRel {
-						offset: u32,
-						info: u32,
-					}
-					let rels: Vec<ElfRel> = read_relocations(reader, shdr)?;
+					let rels: Vec<elf::Rel32> = read_relocations(reader, shdr)?;
 					for rel in rels {
 						add_relocation_x86(self, rel.offset as _, rel.info as _, 0)?;
 					}
