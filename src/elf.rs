@@ -6,6 +6,27 @@ use std::{io, mem};
 pub const ET_REL: u16 = 1;
 pub const ET_EXEC: u16 = 2;
 
+// segment type
+pub const PT_LOAD: u32 = 1;
+// segment flags
+pub const PF_X: u32 = 1 << 0;
+pub const PF_W: u32 = 1 << 1;
+pub const PF_R: u32 = 1 << 2;
+
+
+pub const DT_NEEDED: u32 = 1;
+pub const DT_HASH: u32 = 4;
+pub const DT_STRTAB: u32 = 5;
+pub const DT_SYMTAB: u32 = 6;
+pub const DT_STRSZ: u32 = 10;
+pub const DT_SYMENT: u32 = 11;
+pub const DT_REL: u32 = 17;
+pub const DT_RELSZ: u32 = 18;
+pub const DT_RELENT: u32 = 19;
+  
+pub const PT_DYNAMIC: u32 = 2;
+pub const PT_INTERP: u32 = 3;
+
 #[allow(unused)]
 pub const SHT_PROGBITS: u32 = 1; // Program data
 #[allow(unused)]
@@ -40,7 +61,7 @@ pub const SHN_ABS: u16 = 0xfff1;
 pub const SHN_COMMON: u16 = 0xfff2;
 
 #[repr(C)]
-pub struct Header32 {
+pub struct Ehdr32 {
 	pub ident: [u8; 4],
 	pub class: u8,
 	pub data: u8,
@@ -63,7 +84,7 @@ pub struct Header32 {
 	pub shstrndx: u16,
 }
 
-impl Default for Header32 {
+impl Default for Ehdr32 {
 	fn default() -> Self {
 		Self {
 			ident: [0x7F, b'E', b'L', b'F'],
@@ -90,7 +111,11 @@ impl Default for Header32 {
 	}
 }
 
-impl Header32 {
+impl Ehdr32 {
+	pub fn offsetof_entry(&self) -> usize {
+		0x18
+	}
+	
 	pub fn section_offset(&self, ndx: u16) -> u64 {
 		ndx as u64 * self.shentsize as u64 + self.shoff as u64
 	}
@@ -118,8 +143,6 @@ pub struct Shdr32 {
 	pub addralign: u32,
 	pub entsize: u32,
 }
-
-pub const PT_LOAD: u32 = 0;
 
 #[repr(C)]
 pub struct Phdr32 {
