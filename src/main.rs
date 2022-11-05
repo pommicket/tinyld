@@ -369,7 +369,7 @@ struct Executable {
 	interp: Vec<u8>,
 	load_addr: u64,
 	bss: Option<(u64, u64)>,
-	relocations: Vec<Relocation>,
+	relocations: Vec<(Relocation, u64)>,
 	strtab: Vec<u8>,
 	symbol_strtab_offsets: HashMap<SymbolName, u64>,
 	lib_strtab_offsets: Vec<u64>,
@@ -410,7 +410,7 @@ impl Executable {
 		self.lib_strtab_offsets.push(s);
 	}
 	
-	pub fn add_relocation(&mut self, symbol_names: &SymbolNames, rel: &Relocation) {
+	pub fn add_relocation(&mut self, symbol_names: &SymbolNames, rel: &Relocation, addr: u64) {
 		let name = rel.sym;
 		
 		if self.symbol_strtab_offsets.get(&name).is_none() {
@@ -418,7 +418,7 @@ impl Executable {
 			let offset = self.add_string(s);
 			self.symbol_strtab_offsets.insert(name, offset);
 		}
-		self.relocations.push(rel.clone());
+		self.relocations.push((rel.clone(), addr));
 	}
 	
 	fn segment_count(&self) -> u16 {
@@ -450,7 +450,6 @@ impl Executable {
 	
 	pub fn write<T: Write + Seek>(&self, data: &[u8], out: &mut T) -> LinkResult<()> {
 		let load_addr = self.load_addr as u32;
-		let data_addr: u32 = self.data_addr() as u32;
 		
 		// start by writing data.
 		out.seek(io::SeekFrom::Start(self.data_offset()))?;
@@ -488,11 +487,10 @@ impl Executable {
 			}
 			// now reltab
 			let reltab_offset = out.stream_position()?;
-			for reloc in self.relocations.iter() {
+			for (reloc, addr) in self.relocations.iter() {
 				let index = *symbols.get(&reloc.sym).unwrap();
-				println!("{:x}", index << 8 | u32::from(reloc.r#type.to_x86_u8()));
 				let rel = elf::Rel32 {
-					offset: load_addr, // @TODO
+					offset: *addr as u32,
 					info: index << 8 | u32::from(reloc.r#type.to_x86_u8()),
 				};
 				out.write_all(&rel.to_bytes())?;
@@ -502,15 +500,15 @@ impl Executable {
 			let hashtab_offset = out.stream_position()?;
 			// put everything in a single bucket
 			let nsymbols = symbols.len() as u32;
-			out.write_all(&u32::to_le_bytes(1))?;
-			out.write_all(&u32::to_le_bytes(nsymbols))?;
+			out.write_all(&u32::to_le_bytes(1))?; // nbucket
+			out.write_all(&u32::to_le_bytes(nsymbols + 1))?; // nchain
 			out.write_all(&u32::to_le_bytes(0))?; // bucket begins at 0
 			// chain 1 -> 2 -> 3 -> ... -> n -> 0
 			for i in 1..nsymbols {
 				out.write_all(&u32::to_le_bytes(i))?;
 			}
-			// @OPTIMIZE: can be removed with potentially disastrous results if
-			// a symbol is not found.
+			out.write_all(&u32::to_le_bytes(0))?;
+			// i don't know why this needs to be here.
 			out.write_all(&u32::to_le_bytes(0))?;
 			
 			
@@ -546,13 +544,13 @@ impl Executable {
 		let mut ehdr = elf::Ehdr32::default();
 		ehdr.phnum = self.segment_count();
 		ehdr.phoff = elf::Ehdr32::size_of() as u32;
-		ehdr.entry = self.data_offset().try_into().map_err(|_| LinkError::TooLarge)?;
+		ehdr.entry = self.data_addr().try_into().map_err(|_| LinkError::TooLarge)?;
 		out.write_all(&ehdr.to_bytes())?;
 		
 		let phdr_data = elf::Phdr32 {
 			flags: elf::PF_R | elf::PF_W | elf::PF_X, // read, write, execute
 			offset: 0,
-			vaddr: data_addr,
+			vaddr: load_addr,
 			filesz: file_size,
 			memsz: file_size,
 			..Default::default()
@@ -1016,12 +1014,18 @@ impl Linker {
 			},
 		}
 	}
-
-	fn apply_relocation(&mut self, rel: Relocation, data: &mut [u8]) -> Result<(), LinkError> {
+	
+	fn get_rel_apply_data_offset(&self, rel: &Relocation) -> Option<u64> {
 		let apply_symbol = rel.r#where.0;
-		let apply_offset = rel.r#where.1 + match self.symbol_data_offsets.get(&apply_symbol) {
-			None => return Ok(()), // this relocation isn't in a section we care about
-			Some(a) => *a,
+		let r = self.symbol_data_offsets.get(&apply_symbol)?;
+		Some(*r + rel.r#where.1)
+	}
+
+	fn apply_relocation(&mut self, rel: &Relocation, data: &mut [u8]) -> Result<(), LinkError> {
+		let apply_symbol = rel.r#where.0;
+		let apply_offset = match self.get_rel_apply_data_offset(&rel) {
+			Some(data_offset) => data_offset,
+			None => return Ok(())  // this relocation isn't in a data section so there's nothing we can do about it
 		};
 		let apply_addr = apply_offset + self.data_addr;
 
@@ -1136,12 +1140,6 @@ impl Linker {
 		exec.set_interp("/lib/ld-linux.so.2");
 		exec.add_lib("libc.so.6");
 		
-		for rel in relocations.iter() {
-			let mut _data = [0; MAX_REL_SIZE];
-			if self.get_relocation_data(rel, 0, &mut _data)?.is_none() {
-				exec.add_relocation(&self.symbol_names, rel);
-			}
-		}
 		
 		self.data_addr = exec.data_addr();
 
@@ -1158,8 +1156,17 @@ impl Linker {
 		let mut data = vec![];
 		self.add_data_for_symbol(&mut data, &symbol_graph, entry_id)?;
 
+		for rel in relocations.iter() {
+			self.apply_relocation(&rel, &mut data)?;
+		}
+		
 		for rel in relocations {
-			self.apply_relocation(rel, &mut data)?;
+			let mut _data = [0; MAX_REL_SIZE];
+			if self.get_relocation_data(&rel, 0, &mut _data)?.is_none() {
+				if let Some(data_offset) = self.get_rel_apply_data_offset(&rel) {
+					exec.add_relocation(&self.symbol_names, &rel, self.data_addr + data_offset);
+				}
+			}
 		}
 		
 		exec.write(&data, out)
