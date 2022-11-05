@@ -2,9 +2,9 @@
 // you need to use -fno-pic with gcc -- got,plt relocations aren't supported
 // and also make the executable bigger.
 use fs::File;
-use io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
+use io::{BufReader, BufWriter, Seek, Write};
 use std::collections::{BTreeMap, HashMap};
-use std::{fmt, fs, io, mem, ptr};
+use std::{fmt, fs, io, mem};
 
 #[cfg(target_endian = "big")]
 compile_error! {"WHY do you have a big endian machine???? it's the 21st century, buddy. this program won't work fuck you"}
@@ -12,7 +12,8 @@ compile_error! {"WHY do you have a big endian machine???? it's the 21st century,
 mod elf;
 mod util;
 
-use elf::{FromBytes, ToBytes};
+use elf::ToBytes;
+use elf::Reader as ELFReader;
 use util::u32_from_le_slice;
 
 pub enum LinkError {
@@ -50,6 +51,7 @@ impl From<&LinkError> for String {
 
 pub enum LinkWarning {
 	RelSymNotFound { source: String, name: String },
+	RelUnsupported(u8),
 	RelOOB(String, u64),
 	RelNoData(String, u64),
 	RelNoValue(String),
@@ -66,6 +68,7 @@ impl fmt::Display for LinkWarning {
 				"offset {source}+0x{offset:x} not in a data/text section. relocation will be ignored."
 			),
 			RelNoValue(name) => write!(f, "can't figure out value of symbol '{name}' (relocation ignored)."),
+			RelUnsupported(x) => write!(f, "Unsupported relocation type {x} (relocation ignored)."),
 		}
 	}
 }
@@ -76,13 +79,9 @@ impl From<&LinkWarning> for String {
 	}
 }
 
-pub enum ElfError {
-	NotAnElf,
-	Not32Bit,
-	NotLE,
-	BadVersion,
+pub enum ObjectError {
+	Elf(elf::Error),
 	BadType,
-	BadMachine,
 	BadUtf8,
 	BadSymtab,
 	BadLink(u64),
@@ -90,32 +89,28 @@ pub enum ElfError {
 	UnsupportedRelocation(u8),
 	BadSymIdx(u64),
 	NoStrtab,
-	IO(io::Error),
 }
 
-impl From<&ElfError> for String {
-	fn from(e: &ElfError) -> String {
+impl From<elf::Error> for ObjectError {
+	fn from(e: elf::Error) -> Self {
+		Self::Elf(e)
+	}
+}
+
+impl From<&ObjectError> for String {
+	fn from(e: &ObjectError) -> String {
 		format!("{e}")
 	}
 }
 
-impl fmt::Display for ElfError {
+impl fmt::Display for ObjectError {
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-		use ElfError::*;
+		use ObjectError::*;
 		match self {
 			// Display for UnexpectedEof *should* be this but is less clear
 			//  ("failed to fill whole buffer")
-			IO(i) if i.kind() == io::ErrorKind::UnexpectedEof => write!(f, "unexpected EOF"),
-			IO(i) => write!(f, "IO error: {i}"),
-			NotAnElf => write!(f, "not an ELF file"),
-			Not32Bit => write!(f, "ELF file is not 32-bit"),
-			NotLE => write!(f, "ELF file is not little-endian"),
-			BadVersion => write!(f, "ELF version is not 1 (are you living in the future?)"),
-			BadType => write!(f, "wrong type of ELF file"),
-			BadMachine => write!(
-				f,
-				"unsupported architecture (only x86 is currently supported)"
-			),
+			Elf(e) => write!(f, "{e}"),
+			BadType => write!(f, "wrong type of ELF file (not an object file)"),
 			BadUtf8 => write!(f, "bad UTF-8 in ELF file"),
 			BadSymtab => write!(f, "bad ELF symbol table"),
 			BadRelHeader => write!(f, "bad ELF relocation header"),
@@ -124,12 +119,6 @@ impl fmt::Display for ElfError {
 			BadSymIdx(i) => write!(f, "bad symbol index: {i}"),
 			NoStrtab => write!(f, "object has no .strtab section"),
 		}
-	}
-}
-
-impl From<io::Error> for ElfError {
-	fn from(e: io::Error) -> ElfError {
-		ElfError::IO(e)
 	}
 }
 
@@ -189,6 +178,7 @@ type SymbolIdType = u32;
 struct SymbolId(SymbolIdType);
 
 #[derive(Copy, Clone, Debug)]
+#[allow(dead_code)] // @TODO @TEMPORARY
 enum SymbolType {
 	Function,
 	Object,
@@ -205,7 +195,7 @@ enum SymbolValue {
 #[allow(dead_code)] // @TODO @TEMPORARY
 #[derive(Debug)]
 struct SymbolInfo {
-	r#type: SymbolType,
+	r#type: elf::SymbolType,
 	value: Option<SymbolValue>,
 	size: u64,
 }
@@ -279,49 +269,20 @@ impl Symbols {
 	}
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RelocationType {
-	Direct32,
-	Pc32,
-}
-
-impl RelocationType {
-	fn from_x86_u8(id: u8) -> Result<Self, ElfError> {
-		use RelocationType::*;
-		Ok(match id {
-			1 => Direct32,
-			2 => Pc32,
-			_ => return Err(ElfError::UnsupportedRelocation(id)),
-		})
-	}
-
-	fn to_x86_u8(self) -> u8 {
-		use RelocationType::*;
-		match self {
-			Direct32 => 1,
-			Pc32 => 2,
-		}
-	}
-}
-
 #[derive(Debug, Clone)]
 struct Relocation {
 	r#where: (SymbolId, u64), // (symbol containing relocation, offset in symbol where relocation needs to be applied)
 	source_id: SourceId,
-	source_offset: u64,
 	sym: SymbolName,
-	r#type: RelocationType,
+	r#type: elf::RelType,
 	addend: i64,
 }
 
 struct Linker {
-	src_strtab_offset: u64,   // .strtab offset in current object file
-	src_shstrtab_offset: u64, // .shstrtab offset in current object file
 	symbols: Symbols,
 	symbol_names: SymbolNames,
 	relocations: Vec<Relocation>,
 	undefined_relocations: Vec<Relocation>, // library relocations
-	sections: Vec<elf::Shdr32>,
 	sources: Vec<String>,
 	bss_size: u64,                               // output bss size
 	bss_addr: u64,                               // output bss address
@@ -332,13 +293,13 @@ struct Linker {
 
 // this maps between offsets in an object file and symbols defined in that file.
 // this is used to figure out where relocations are taking place.
-struct AddrMap {
+struct SymbolOffsetMap {
 	map: BTreeMap<(u64, u64), SymbolId>,
 }
 
-impl AddrMap {
+impl SymbolOffsetMap {
 	fn new() -> Self {
-		AddrMap {
+		SymbolOffsetMap {
 			map: BTreeMap::new(),
 		}
 	}
@@ -492,7 +453,7 @@ impl Executable {
 				let index = *symbols.get(&reloc.sym).unwrap();
 				let rel = elf::Rel32 {
 					offset: *addr as u32,
-					info: index << 8 | u32::from(reloc.r#type.to_x86_u8()),
+					info: index << 8 | u32::from(reloc.r#type.to_x86_u8().unwrap()),
 				};
 				out.write_all(&rel.to_bytes())?;
 			}
@@ -636,12 +597,9 @@ impl Linker {
 		Linker {
 			symbols: Symbols::new(),
 			symbol_names: SymbolNames::new(),
-			src_strtab_offset: 0,
-			src_shstrtab_offset: 0,
 			bss_addr: 0,
 			bss_size: 0,
 			data_addr: 0,
-			sections: vec![],
 			relocations: vec![],
 			undefined_relocations: vec![],
 			sources: vec![],
@@ -654,122 +612,51 @@ impl Linker {
 		&self.sources[id.0 as usize]
 	}
 
-	fn get_shstrtab(&self, reader: &mut BufReader<File>, offset: u32) -> Result<String, ElfError> {
-		reader.seek(io::SeekFrom::Start(
-			offset as u64 + self.src_shstrtab_offset,
-		))?;
-		let mut bytes = vec![];
-		reader.read_until(0, &mut bytes)?;
-		bytes.pop(); // remove terminating \0
-		String::from_utf8(bytes).map_err(|_| ElfError::BadUtf8)
-	}
-
-	fn get_strtab(&self, reader: &mut BufReader<File>, offset: u32) -> Result<String, ElfError> {
-		reader.seek(io::SeekFrom::Start(offset as u64 + self.src_strtab_offset))?;
-		let mut bytes = vec![];
-		reader.read_until(0, &mut bytes)?;
-		bytes.pop(); // remove terminating \0
-		String::from_utf8(bytes).map_err(|_| ElfError::BadUtf8)
-	}
-
-	// returns SymbolName corresponding to the symbol
-	fn read_symbol(
+	fn add_symbol(
 		&mut self,
 		source: SourceId,
-		addr_map: &mut AddrMap,
-		reader: &mut BufReader<File>,
-	) -> Result<SymbolName, ElfError> {
-		let mut sym_buf = [0u8; 16];
-		reader.read_exact(&mut sym_buf)?;
-		let sym = elf::Sym32::from_bytes(sym_buf);
-		let r#type = sym.info & 0xf;
-		let bind = sym.info >> 4;
-		let name = self.get_strtab(reader, sym.name)?;
-		let name_id = self.symbol_names.add(name);
-		let size = sym.size as u64;
-
-		let r#type = match r#type {
-			elf::STT_OBJECT => SymbolType::Object,
-			elf::STT_FUNC => SymbolType::Function,
-			_ => SymbolType::Other,
-		};
-
+		elf: &elf::Reader32LE,
+		offset_map: &mut SymbolOffsetMap,
+		symbol: &elf::Symbol,
+	) -> Result<(), ObjectError> {
 		let mut data_offset = None;
+		let name_id = self.symbol_names.add(elf.symbol_name(symbol)?);
 
-		let value = match sym.shndx {
-			elf::SHN_UNDEF | elf::SHN_COMMON => None,
-			elf::SHN_ABS => Some(SymbolValue::Absolute(sym.value as u64)),
-			ndx if (ndx as usize) < self.sections.len() => {
-				let ndx = ndx as usize;
-				match self.sections[ndx].r#type {
-					elf::SHT_PROGBITS => {
-						let offset = self.sections[ndx].offset as u64 + sym.value as u64;
-						data_offset = Some(offset);
-						reader.seek(io::SeekFrom::Start(offset))?;
-						let mut data = vec![0; size as usize];
-						reader.read_exact(&mut data)?;
+		let value = match symbol.value {
+			elf::SymbolValue::Undefined => None,
+			elf::SymbolValue::Absolute(n) => Some(SymbolValue::Absolute(n)),
+			elf::SymbolValue::SectionOffset(shndx, offset) => {
+				match elf.section_type(shndx) {
+					Some(elf::SectionType::ProgBits) => {
+						let mut data = vec![0; symbol.size as usize];
+						data_offset = Some(elf.section_offset(shndx).unwrap() + offset);
+						elf.read_section_data_exact(shndx, offset, &mut data)?;
 						Some(SymbolValue::Data(data))
-					}
-					elf::SHT_NOBITS => {
+					},
+					Some(elf::SectionType::NoBits) => {
 						let p = self.bss_size;
-						self.bss_size += size;
+						self.bss_size += symbol.size;
 						Some(SymbolValue::Bss(p))
-					}
+					},
 					_ => None, // huh
 				}
 			}
-			_ => None,
 		};
 
 		let info = SymbolInfo {
-			r#type,
+			r#type: symbol.r#type,
 			value,
-			size,
+			size: symbol.size,
 		};
-		let symbol_id = match bind {
-			elf::STB_LOCAL => self.symbols.add_local(source, name_id, info),
-			elf::STB_GLOBAL => self.symbols.add_global(source, name_id, info),
-			elf::STB_WEAK => self.symbols.add_weak(source, name_id, info),
-			_ => return Ok(name_id),
+		let symbol_id = match symbol.bind {
+			elf::SymbolBind::Local => self.symbols.add_local(source, name_id, info),
+			elf::SymbolBind::Global => self.symbols.add_global(source, name_id, info),
+			elf::SymbolBind::Weak => self.symbols.add_weak(source, name_id, info),
+			_ => return Ok(()), // eh
 		};
 
 		if let Some(offset) = data_offset {
-			addr_map.add_symbol(offset, size, symbol_id);
-		}
-		Ok(name_id)
-	}
-
-	fn add_relocation_x86(
-		&mut self,
-		symtab: &[SymbolName],
-		addr_map: &AddrMap,
-		source_id: SourceId,
-		offset: u64,
-		info: u32,
-		addend: i32,
-	) -> Result<(), ElfError> {
-		let r#type = info as u8;
-		let sym_idx = info >> 8;
-
-		if let Some(r#where) = addr_map.get(offset) {
-			match symtab.get(sym_idx as usize) {
-				Some(sym) => {
-					self.relocations.push(Relocation {
-						r#where,
-						source_id,
-						source_offset: offset,
-						sym: *sym,
-						r#type: RelocationType::from_x86_u8(r#type)?,
-						addend: addend.into(),
-					});
-				}
-				None => return Err(ElfError::BadSymIdx(sym_idx.into())),
-			}
-		} else {
-			self.emit_warning(LinkWarning::RelNoData(
-				self.source_name(source_id).into(),
-				offset,
-			));
+			offset_map.add_symbol(offset, symbol.size, symbol_id);
 		}
 		Ok(())
 	}
@@ -778,164 +665,38 @@ impl Linker {
 		&mut self,
 		name: &str,
 		reader: &mut BufReader<File>,
-	) -> Result<(), ElfError> {
-		use ElfError::*;
+	) -> Result<(), ObjectError> {
+		use ObjectError::*;
 
-		let mut addr_map = AddrMap::new();
-
-		reader.seek(io::SeekFrom::Start(0))?;
+		let mut offset_map = SymbolOffsetMap::new();
 
 		let source_id = SourceId(self.sources.len() as _);
 		self.sources.push(name.into());
 
-		let mut elf = [0u8; 0x34];
-		reader.read_exact(&mut elf)?;
-		let elf: elf::Ehdr32 = unsafe { mem::transmute(elf) };
-
-		if elf.ident != [0x7f, b'E', b'L', b'F'] {
-			return Err(NotAnElf);
-		}
-		if elf.class != 1 {
-			return Err(Not32Bit);
-		}
-		if elf.data != 1 {
-			return Err(NotLE);
-		}
-		if elf.version != 1 || elf.version2 != 1 {
-			return Err(BadVersion);
-		}
-		if elf.r#type != elf::ET_REL {
+		let elf = elf::Reader32LE::new(reader)?;
+		if elf.r#type() != elf::Type::Rel {
 			return Err(BadType);
 		}
-		if elf.machine != 3 {
-			return Err(BadMachine);
+		
+		for symbol in elf.symbols() {
+			self.add_symbol(source_id, &elf, &mut offset_map, symbol)?;
 		}
-
-		let mut shdr_buf = [0u8; 0x28];
-		self.src_shstrtab_offset = {
-			// read .shstrtab header
-			reader.seek(elf.section_seek(elf.shstrndx))?;
-			reader.read_exact(&mut shdr_buf)?;
-			let shdr: elf::Shdr32 = unsafe { mem::transmute(shdr_buf) };
-			shdr.offset as u64
-		};
-
-		let mut sections_by_name = HashMap::with_capacity(elf.shnum as _);
-		self.sections.reserve(elf.shnum as _);
-		for s_idx in 0..elf.shnum {
-			reader.seek(elf.section_seek(s_idx))?;
-			reader.read_exact(&mut shdr_buf)?;
-			let shdr: elf::Shdr32 = unsafe { mem::transmute(shdr_buf) };
-			let name = self.get_shstrtab(reader, shdr.name)?;
-			sections_by_name.insert(name.clone(), shdr.clone());
-			self.sections.push(shdr);
-		}
-
-		self.src_strtab_offset = if let Some(strtab) = sections_by_name.get(".strtab") {
-			strtab.offset.into()
-		} else {
-			return Err(NoStrtab);
-		};
-
-		let mut symtab = vec![];
-		if let Some(shdr) = sections_by_name.get(".symtab") {
-			// read .symtab
-			let size = shdr.size as u64;
-			let entsize = shdr.entsize as u64;
-			let offset = shdr.offset as u64;
-			if size % entsize != 0 || entsize < 16 {
-				return Err(BadSymtab);
-			}
-			let count: u32 = (size / entsize).try_into().map_err(|_| BadSymtab)?; // 4 billion symbols is ridiculous
-			symtab.reserve(count as usize);
-			for sym_idx in 0..count {
-				reader.seek(io::SeekFrom::Start(offset + sym_idx as u64 * entsize))?;
-				let name = self.read_symbol(source_id, &mut addr_map, reader)?;
-				symtab.push(name);
-			}
-		}
-
-		for shdr in sections_by_name.values() {
-			// @TODO @FIX we only process relocations relating to .symtab currently.
-			match self.sections.get(shdr.link as usize) {
-				None => continue,
-				Some(h) => {
-					if self.get_shstrtab(reader, h.name)? != ".symtab" {
-						continue;
-					}
-				}
-			}
-
-			fn read_relocations<const N: usize, RelType: FromBytes<N> + ToBytes<N>>(
-				reader: &mut BufReader<File>,
-				shdr: &elf::Shdr32,
-			) -> Result<Vec<RelType>, ElfError> {
-				let offset = shdr.offset as u64;
-				let size = shdr.size as u64;
-				let entsize = shdr.entsize as u64;
-				if size % entsize != 0 || entsize < mem::size_of::<RelType>() as u64 {
-					return Err(BadRelHeader);
-				}
-				let count = size / entsize;
-				let mut relocations = Vec::with_capacity(count as _);
-				let mut rel_buf = [0; N];
-
-				for rel_idx in 0..count {
-					reader.seek(io::SeekFrom::Start(offset + rel_idx * entsize))?;
-
-					reader.read_exact(&mut rel_buf)?;
-					let mut rel = mem::MaybeUninit::uninit();
-					let rel = unsafe {
-						ptr::copy_nonoverlapping(
-							(&rel_buf[0]) as *const u8,
-							rel.as_mut_ptr() as *mut u8,
-							mem::size_of::<RelType>(),
-						);
-						rel.assume_init()
-					};
-
-					relocations.push(rel);
-				}
-				Ok(relocations)
-			}
-
-			let info_section_offset = self
-				.sections
-				.get(shdr.info as usize)
-				.ok_or(BadLink(shdr.info as u64))?
-				.offset as u64;
-
-			let add_relocation_x86 =
-				|me: &mut Self, offset: u32, info: u32, addend: i32| -> Result<(), ElfError> {
-					me.add_relocation_x86(
-						&symtab,
-						&addr_map,
-						source_id,
-						info_section_offset + offset as u64,
-						info,
-						addend,
-					)
-				};
-
-			match shdr.r#type {
-				elf::SHT_RELA => {
-					let rels: Vec<elf::Rela32> = read_relocations(reader, shdr)?;
-					for rela in rels {
-						add_relocation_x86(
-							self,
-							rela.offset as _,
-							rela.info as _,
-							rela.addend as _,
-						)?;
-					}
-				}
-				elf::SHT_REL => {
-					let rels: Vec<elf::Rel32> = read_relocations(reader, shdr)?;
-					for rel in rels {
-						add_relocation_x86(self, rel.offset as _, rel.info as _, 0)?;
-					}
-				}
-				_ => {}
+		
+		for rel in elf.relocations() {
+			if let Some(r#where) = offset_map.get(rel.offset) {
+				let sym = self.symbol_names.add(elf.symbol_name(&rel.symbol)?);
+				self.relocations.push(Relocation {
+					r#where,
+					source_id,
+					sym,
+					r#type: rel.r#type,
+					addend: rel.addend,
+				});
+			} else {
+				self.emit_warning(LinkWarning::RelNoData(
+					self.source_name(source_id).into(),
+					0, // @TODO
+				));
 			}
 		}
 
@@ -1027,12 +788,13 @@ impl Linker {
 		enum Value {
 			U32(u32),
 		}
-		use RelocationType::*;
+		use elf::RelType::*;
 		use Value::*;
 
 		let value = match rel.r#type {
 			Direct32 => U32(symbol_value as u32 + addend as u32),
 			Pc32 => U32(symbol_value as u32 + addend as u32 - pc as u32),
+			Other(x) => {self.emit_warning(LinkWarning::RelUnsupported(x)); return Ok(()) },
 		};
 
 		let apply_symbol_info = match self.symbols.get_mut_info_from_id(apply_symbol) {
@@ -1073,7 +835,7 @@ impl Linker {
 			_ => {
 				self.emit_warning(LinkWarning::RelNoData(
 					self.source_name(rel.source_id).into(),
-					rel.source_offset,
+					apply_offset,
 				));
 			}
 		}
@@ -1234,3 +996,4 @@ fn main() {
 		eprintln!("Error linking: {e}");
 	}
 }
+

@@ -1,6 +1,7 @@
 // basic ELF types and constants
 
-use std::{io, mem};
+use std::{io, mem, fmt};
+use io::{BufRead, Seek};
 
 pub trait ToBytes<const N: usize> {
 	fn to_bytes(self) -> [u8; N];
@@ -9,6 +10,8 @@ pub trait ToBytes<const N: usize> {
 pub trait FromBytes<const N: usize> {
 	fn from_bytes(bytes: [u8; N]) -> Self;
 }
+
+// @TODO: make all of these constants private
 
 // executable type
 pub const ET_REL: u16 = 1;
@@ -35,28 +38,18 @@ pub const DT_RELENT: u32 = 19;
 pub const PT_DYNAMIC: u32 = 2;
 pub const PT_INTERP: u32 = 3;
 
-#[allow(unused)]
 pub const SHT_PROGBITS: u32 = 1; // Program data
-#[allow(unused)]
 pub const SHT_SYMTAB: u32 = 2; // Symbol table
-#[allow(unused)]
-pub const SHT_STRTAB: u32 = 3; // String table
-#[allow(unused)]
+//pub const SHT_STRTAB: u32 = 3; // String table
 pub const SHT_RELA: u32 = 4; // Relocation entries with addends
-#[allow(unused)]
-pub const SHT_HASH: u32 = 5; // Symbol hash table
-#[allow(unused)]
-pub const SHT_DYNAMIC: u32 = 6; // Dynamic linking information
-#[allow(unused)]
-pub const SHT_NOTE: u32 = 7; // Notes
-#[allow(unused)]
+//pub const SHT_DYNAMIC: u32 = 6; // Dynamic linking information
 pub const SHT_NOBITS: u32 = 8; // Program space with no data (bss)
-#[allow(unused)]
 pub const SHT_REL: u32 = 9; // Relocation entries, no addends
 
 // symbol type
 pub const STT_OBJECT: u8 = 1;
 pub const STT_FUNC: u8 = 2;
+pub const STT_SECTION: u8 = 3;
 
 // symbol bind
 pub const STB_LOCAL: u8 = 0;
@@ -66,7 +59,7 @@ pub const STB_WEAK: u8 = 2;
 // section number (for relocations)
 pub const SHN_UNDEF: u16 = 0;
 pub const SHN_ABS: u16 = 0xfff1;
-pub const SHN_COMMON: u16 = 0xfff2;
+//pub const SHN_COMMON: u16 = 0xfff2;
 
 #[repr(C)]
 pub struct Ehdr32 {
@@ -122,14 +115,6 @@ impl Default for Ehdr32 {
 impl Ehdr32 {
 	pub fn size_of() -> usize {
 		mem::size_of::<Self>()
-	}
-
-	pub fn section_offset(&self, ndx: u16) -> u64 {
-		ndx as u64 * self.shentsize as u64 + self.shoff as u64
-	}
-
-	pub fn section_seek(&self, ndx: u16) -> io::SeekFrom {
-		io::SeekFrom::Start(self.section_offset(ndx))
 	}
 }
 
@@ -221,7 +206,463 @@ macro_rules! impl_bytes {
 }
 
 impl_bytes!(Ehdr32, 0x34);
+impl_bytes!(Shdr32, 0x28);
 impl_bytes!(Phdr32, 0x20);
 impl_bytes!(Sym32, 16);
 impl_bytes!(Rela32, 12);
 impl_bytes!(Rel32, 8);
+
+#[derive(Debug)]
+pub enum Error {
+	IO(io::Error),
+	NotAnElf,
+	BadUtf8,
+	BadVersion,
+	UnsupportedClass(u8, u8),
+	BadShStrNdx(u16),
+	BadSymShNdx(u16),
+	BadSymIndex(u64),
+	BadLink(u32),
+	BadSectionIndex(u16),
+	NoStrtab,
+}
+
+
+impl From<io::Error> for Error {
+	fn from(e: io::Error) -> Error {
+		Error::IO(e)
+	}
+}
+
+impl fmt::Display for Error {
+	fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+		use Error::*;
+		match self {
+			IO(i) if i.kind() == io::ErrorKind::UnexpectedEof => write!(f, "unexpected EOF"),
+			IO(i) => write!(f, "IO error: {i}"),
+			NotAnElf => write!(f, "Not an ELF file."),
+			UnsupportedClass(class, data) => {
+				let class_str = match class {
+					1 => "32",
+					2 => "64",
+					_ => "??",
+				};
+				let data_str = match data {
+					1 => "little",
+					2 => "big",
+					_ => "??",
+				};
+				write!(f, "This type of executable ({class_str}-bit {data_str}-endian) is not supported.")
+			},
+			BadVersion => write!(f, "Apparently you're living in the future. Where I'm from, there's only ELF version 1"),
+			BadUtf8 => write!(f, "Bad UTF-8 in ELF file."),
+			BadShStrNdx(n) => write!(f, "e_shstrndx ({n}) does not refer to a valid section."),
+			BadSymShNdx(n) => write!(f, "Bad symbol shndx field: {n}."),
+			BadSymIndex(x) => write!(f, "Bad symbol index: {x}"),
+			NoStrtab => write!(f, "No .strtab section found."),
+			BadLink(x) => write!(f, "Bad section link: {x}"),
+			BadSectionIndex(x) => write!(f, "Bad section index: {x}"),
+		}
+	}
+}
+
+impl From<&Error> for String {
+	fn from(e: &Error) -> String {
+		format!("{e}")
+	}
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+fn bytes_to_string(bytes: Vec<u8>) -> Result<String> {
+	String::from_utf8(bytes).map_err(|_| Error::BadUtf8)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Machine {
+	X86,
+	Amd64,
+	Other(u16),
+}
+
+impl From<u16> for Machine {
+	fn from(x: u16) -> Self {
+		use Machine::*;
+		match x {
+			3 => X86,
+			0x3e => Amd64,
+			_ => Other(x),
+		}
+	}
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum SectionType {
+	ProgBits,
+	NoBits,
+	Rel,
+	Rela,
+	Symtab,
+	Other(u32)
+}
+
+impl From<u32> for SectionType {
+	fn from(x: u32) -> Self {
+		use SectionType::*;
+		match x {
+			SHT_PROGBITS => ProgBits,
+			SHT_NOBITS => NoBits,
+			SHT_REL => Rel,
+			SHT_RELA => Rela,
+			SHT_SYMTAB => Symtab,
+			_ => Other(x),
+		}
+	}
+}
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum Type {
+	Rel,
+	Exec,
+	Other(u16)
+}
+
+impl From<u16> for Type {
+	fn from(x: u16) -> Self {
+		use Type::*;
+		match x {
+			1 => Rel,
+			2 => Exec,
+			_ => Other(x),
+		}
+	}
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum SymbolBind {
+	Global,
+	Weak,
+	Local,
+	Other(u8)
+}
+
+impl From<u8> for SymbolBind {
+	fn from(x: u8) -> Self {
+		use SymbolBind::*;
+		match x {
+			STB_GLOBAL => Global,
+			STB_WEAK => Weak,
+			STB_LOCAL => Local,
+			_ => Other(x),
+		}
+	}
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum SymbolType {
+	Function,
+	Object,
+	Section,
+	Other(u8)
+}
+
+impl From<u8> for SymbolType {
+	fn from(x: u8) -> Self {
+		use SymbolType::*;
+		match x {
+			STT_FUNC => Function,
+			STT_OBJECT => Object,
+			STT_SECTION => Section,
+			_ => Other(x),
+		}
+	}
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum SymbolValue {
+	Undefined,
+	Absolute(u64),
+	SectionOffset(u16, u64),
+}
+
+#[derive(Debug, Clone)]
+pub struct Symbol {
+	name: u64, // offset into .strtab
+	pub size: u64,
+	pub value: SymbolValue,
+	pub bind: SymbolBind,
+	pub r#type: SymbolType,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RelType {
+	Direct32,
+	Pc32,
+	Other(u8),
+}
+
+impl RelType {
+	fn from_u8(id: u8, machine: Machine) -> Self {
+		use RelType::*;
+		use Machine::*;
+		match (machine, id) {
+			(X86, 1) => Direct32,
+			(X86, 2) => Pc32,
+			_ => RelType::Other(id),
+		}
+	}
+
+	pub fn to_x86_u8(self) -> Option<u8> {
+		use RelType::*;
+		Some(match self {
+			Direct32 => 1,
+			Pc32 => 2,
+			Other(x) => x,
+		})
+	}
+}
+
+
+pub struct Relocation {
+	pub r#type: RelType,
+	pub offset: u64, // where the relocation should be applied. for ET_REL, this is a file offset; otherwise, it's an address.
+	pub symbol: Symbol,
+	pub addend: i64,
+}
+
+pub trait Reader where Self: Sized {
+	fn new<T: BufRead + Seek>(reader: T) -> Result<Self>;
+	fn r#type(&self) -> Type;
+	fn machine(&self) -> Machine;
+	fn entry(&self) -> u64;
+	fn symbols(&self) -> &[Symbol];
+	fn relocations(&self) -> &[Relocation];
+	fn symbol_name(&self, sym: &Symbol) -> Result<String>;
+	fn section_type(&self, idx: u16) -> Option<SectionType>;
+	fn read_section_data_exact(&self, idx: u16, offset: u64, data: &mut [u8]) -> Result<()>;
+}
+
+pub struct Reader32LE {
+	ehdr: Ehdr32,
+	shdrs: Vec<Shdr32>,
+	symbols: Vec<Symbol>,
+	strtab_idx: Option<u16>,
+	section_data: Vec<Vec<u8>>,
+	relocations: Vec<Relocation>,
+}
+
+impl Reader32LE {
+	pub fn section_offset(&self, index: u16) -> Option<u64> {
+		let index = usize::from(index);
+		if index >= self.shdrs.len() {
+			None
+		} else {
+			Some(self.shdrs[index].offset.into())
+		}
+	}
+}
+
+impl Reader for Reader32LE {
+	fn new<T: BufRead + Seek>(mut reader: T) -> Result<Self> {
+		use Error::*;
+		
+		let mut hdr_buf = [0; 0x34];
+		reader.read_exact(&mut hdr_buf)?;
+		let ehdr = Ehdr32::from_bytes(hdr_buf);
+		
+		if ehdr.ident != [0x7f, b'E', b'L', b'F'] {
+			return Err(NotAnElf);
+		}
+		if ehdr.class != 1 || ehdr.data != 1 {
+			return Err(UnsupportedClass(ehdr.class, ehdr.data));
+		}
+		if ehdr.version != 1 || ehdr.version2 != 1 {
+			return Err(BadVersion);
+		}
+		
+		let mut shdrs = Vec::with_capacity(ehdr.shnum.into());
+		for i in 0..ehdr.shnum {
+			let offset = u64::from(ehdr.shoff) + u64::from(ehdr.shentsize) * u64::from(i);
+			reader.seek(io::SeekFrom::Start(offset))?;
+			let mut shdr_buf = [0; 0x28];
+			reader.read_exact(&mut shdr_buf)?;
+			shdrs.push(Shdr32::from_bytes(shdr_buf)); 
+		}
+		
+		let mut symtabs = Vec::with_capacity(ehdr.shnum.into());
+		let mut symbols = vec![];
+		let mut section_data = Vec::with_capacity(ehdr.shnum.into());
+		let mut strtab_idx = None;
+		
+		
+		
+		for (s_idx, shdr) in shdrs.iter().enumerate() {
+			let mut data = vec![0; shdr.size as usize];
+			reader.read_exact(&mut data)?;
+			section_data.push(data);
+			
+			if let Some(shstrhdr) = shdrs.get(ehdr.shstrndx as usize) {
+				// get name
+				reader.seek(io::SeekFrom::Start(
+					shstrhdr.offset as u64 + shdr.name as u64,
+				))?;
+				let mut bytes = vec![];
+				reader.read_until(0, &mut bytes)?;
+				bytes.pop(); // remove terminating \0
+				let name = bytes_to_string(bytes)?;
+				
+				if name == ".strtab" {
+					strtab_idx = Some(s_idx as u16);
+				}
+			}
+				
+				
+			
+			let mut symtab = vec![];
+			if shdr.r#type == SHT_SYMTAB && shdr.entsize as usize >= mem::size_of::<Sym32>() {
+				// read symbol table
+				for i in 0..shdr.size / shdr.entsize {
+					let offset = u64::from(shdr.offset) + u64::from(shdr.entsize) * u64::from(i);
+					reader.seek(io::SeekFrom::Start(offset))?;
+					let mut sym_buf = [0; 16];
+					reader.read_exact(&mut sym_buf)?;
+					let sym = Sym32::from_bytes(sym_buf);
+					let value = match sym.shndx {
+						SHN_UNDEF => SymbolValue::Undefined,
+						SHN_ABS => SymbolValue::Absolute(sym.value.into()),
+						idx if idx < ehdr.shnum => SymbolValue::SectionOffset(idx, sym.value.into()),
+						x => return Err(BadSymShNdx(x)),
+					};
+					
+					let symbol = Symbol {
+						name: sym.name.into(),
+						value,
+						r#type: (sym.info & 0xf).into(),
+						bind: (sym.info >> 4).into(),
+						size: sym.size.into(),
+					};
+					symtab.push(symbols.len());
+					symbols.push(symbol);
+				}	
+			}
+			symtabs.push(symtab);
+		}
+		
+		// read relocations
+		let mut relocations = vec![];
+		for shdr in shdrs.iter() {
+			let r#type = shdr.r#type;
+			if !(r#type == SHT_REL || r#type == SHT_RELA) {
+				continue;
+			}
+			let is_rela = r#type == SHT_RELA;
+			
+			if shdr.entsize < 8 {
+				continue;
+			}
+			let count = shdr.size / shdr.entsize;
+			
+			reader.seek(io::SeekFrom::Start(shdr.offset.into()))?;
+			
+			let my_symbols = symtabs.get(shdr.link as usize).ok_or(BadLink(shdr.link))?;
+			for _ in 0..count {
+			
+				let info;
+				let mut offset;
+				let addend;
+				
+				if is_rela {
+					let mut rela_buf = [0; 12];
+					reader.read_exact(&mut rela_buf)?;
+					let rela = Rela32::from_bytes(rela_buf);
+					info = rela.info;
+					offset = rela.offset;
+					addend = rela.addend;
+				} else {
+					let mut rel_buf = [0; 8];
+					reader.read_exact(&mut rel_buf)?;
+					let rel = Rel32::from_bytes(rel_buf);
+					info = rel.info;
+					offset = rel.offset;
+					addend = 0;
+				};
+				
+				
+				if ehdr.r#type == ET_REL {
+					// rel.offset is relative to section
+					if let Some(info_hdr) = shdrs.get(shdr.info as usize) {
+						offset += info_hdr.offset;
+					}
+				}
+				
+				
+				let sym_idx = info >> 8;
+				let symbols_idx = my_symbols.get(sym_idx as usize).ok_or(BadSymIndex(sym_idx.into()))?;
+				let symbol = &symbols[*symbols_idx];
+				
+				relocations.push(Relocation {
+					r#type: RelType::from_u8(info as u8, ehdr.machine.into()),
+					symbol: symbol.clone(),
+					addend: addend.into(),
+					offset: offset.into(),
+				});
+			}
+		}
+		
+		Ok(Self {
+			ehdr,
+			shdrs,
+			symbols,
+			strtab_idx,
+			relocations,
+			section_data
+		})
+	}
+	
+	fn r#type(&self) -> Type {
+		self.ehdr.r#type.into()
+	}
+	
+	fn machine(&self) -> Machine {
+		self.ehdr.machine.into()
+	}
+	
+	fn entry(&self) -> u64 {
+		self.ehdr.entry.into()
+	}
+	
+	fn relocations(&self) -> &[Relocation] {
+		&self.relocations
+	}
+	
+	fn symbols(&self) -> &[Symbol] {
+		&self.symbols
+	}
+	
+	fn symbol_name(&self, sym: &Symbol) -> Result<String> {
+		let strtab = &self.section_data[self.strtab_idx.ok_or(Error::NoStrtab)? as usize];
+		let i = sym.name as usize;
+		let mut end = i;
+		while end < strtab.len() && strtab[end] != b'\0' {
+			end += 1;
+		}
+		bytes_to_string((&strtab[i..end]).to_vec())
+	}
+	
+	fn section_type(&self, idx: u16) -> Option<SectionType> {
+		self.shdrs.get(idx as usize).map(|shdr| shdr.r#type.into())
+	}
+	
+	fn read_section_data_exact(&self, idx: u16, offset: u64, data: &mut [u8]) -> Result<()> {
+		let section = self.section_data.get(usize::from(idx)).ok_or(Error::BadSectionIndex(idx))?;
+		if offset + data.len() as u64 > section.len() as u64 {
+			return Err(Error::IO(io::Error::from(io::ErrorKind::UnexpectedEof)));
+		}
+		
+		let offset = offset as usize;
+		
+		data.copy_from_slice(&section[offset..offset + data.len()]);
+		
+		Ok(())
+	}
+}
