@@ -31,7 +31,7 @@ pub const DT_SYMENT: u32 = 11;
 pub const DT_REL: u32 = 17;
 pub const DT_RELSZ: u32 = 18;
 pub const DT_RELENT: u32 = 19;
-  
+
 pub const PT_DYNAMIC: u32 = 2;
 pub const PT_INTERP: u32 = 3;
 
@@ -123,7 +123,7 @@ impl Ehdr32 {
 	pub fn size_of() -> usize {
 		mem::size_of::<Self>()
 	}
-	
+
 	pub fn section_offset(&self, ndx: u16) -> u64 {
 		ndx as u64 * self.shentsize as u64 + self.shoff as u64
 	}
@@ -205,20 +205,19 @@ pub struct Rel32 {
 }
 
 macro_rules! impl_bytes {
-	($r#type: ident, $n: literal) => {
-		impl FromBytes<$n> for $r#type {
+	($type: ident, $n: literal) => {
+		impl FromBytes<$n> for $type {
 			fn from_bytes(bytes: [u8; $n]) -> Self {
 				unsafe { mem::transmute(bytes) }
 			}
 		}
-			
-		impl ToBytes<$n> for $r#type {
+
+		impl ToBytes<$n> for $type {
 			fn to_bytes(self) -> [u8; $n] {
 				unsafe { mem::transmute(self) }
 			}
 		}
-		
-	}
+	};
 }
 
 impl_bytes!(Ehdr32, 0x34);
