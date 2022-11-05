@@ -425,6 +425,7 @@ impl RelType {
 
 pub struct Relocation {
 	pub r#type: RelType,
+	pub entry_offset: u64, // file offset of relocation metadata (for debugging)
 	pub offset: u64, // where the relocation should be applied. for ET_REL, this is a file offset; otherwise, it's an address.
 	pub symbol: Symbol,
 	pub addend: i64,
@@ -498,6 +499,7 @@ impl Reader for Reader32LE {
 		
 		for (s_idx, shdr) in shdrs.iter().enumerate() {
 			let mut data = vec![0; shdr.size as usize];
+			reader.seek(io::SeekFrom::Start(shdr.offset.into()))?;
 			reader.read_exact(&mut data)?;
 			section_data.push(data);
 			
@@ -565,7 +567,7 @@ impl Reader for Reader32LE {
 			reader.seek(io::SeekFrom::Start(shdr.offset.into()))?;
 			
 			let my_symbols = symtabs.get(shdr.link as usize).ok_or(BadLink(shdr.link))?;
-			for _ in 0..count {
+			for r_idx in 0..count {
 			
 				let info;
 				let mut offset;
@@ -602,6 +604,7 @@ impl Reader for Reader32LE {
 				
 				relocations.push(Relocation {
 					r#type: RelType::from_u8(info as u8, ehdr.machine.into()),
+					entry_offset: shdr.offset as u64 + r_idx as u64 * shdr.entsize as u64,
 					symbol: symbol.clone(),
 					addend: addend.into(),
 					offset: offset.into(),

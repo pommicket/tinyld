@@ -620,7 +620,9 @@ impl Linker {
 		symbol: &elf::Symbol,
 	) -> Result<(), ObjectError> {
 		let mut data_offset = None;
-		let name_id = self.symbol_names.add(elf.symbol_name(symbol)?);
+		let name = elf.symbol_name(symbol)?;
+		println!("{name}");
+		let name_id = self.symbol_names.add(name);
 
 		let value = match symbol.value {
 			elf::SymbolValue::Undefined => None,
@@ -695,7 +697,7 @@ impl Linker {
 			} else {
 				self.emit_warning(LinkWarning::RelNoData(
 					self.source_name(source_id).into(),
-					0, // @TODO
+					rel.entry_offset
 				));
 			}
 		}
