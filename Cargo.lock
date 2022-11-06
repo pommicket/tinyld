@@ -162,6 +162,7 @@ name = "tinyld"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "termcolor",
 ]
 
 [[package]]

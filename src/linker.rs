@@ -1,17 +1,20 @@
 use crate::{elf, util};
 use io::{BufRead, Seek, Write};
 use std::collections::{BTreeMap, HashMap};
-use std::{fmt, io, mem, fs, path};
+use std::{fmt, fs, io, mem, path};
 
-use elf::ToBytes;
 use elf::Reader as ELFReader;
+use elf::ToBytes;
 use util::u32_from_le_slice;
 
 pub enum LinkError {
 	IO(io::Error),
+	/// executable is too large (>4GB on 32-bit platforms)
 	TooLarge,
-	NoEntry(String),         // no entry point
-	EntryNotDefined(String), // entry point is declared, but not defined
+	/// entry point not found
+	NoEntry(String),
+	/// entry point was declared, and (probably) used, but not defined
+	EntryNotDefined(String),
 }
 
 type LinkResult<T> = Result<T, LinkError>;
@@ -41,24 +44,23 @@ impl From<&LinkError> for String {
 }
 
 pub enum LinkWarning {
-	RelSymNotFound { source: String, name: String },
+	/// unsupported relocation type
 	RelUnsupported(u8),
+	/// relocation is too large to fit inside its owner
 	RelOOB(String, u64),
+	/// relocation is in a BSS section or some shit
 	RelNoData(String, u64),
-	RelNoValue(String),
 }
 
 impl fmt::Display for LinkWarning {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		use LinkWarning::*;
 		match self {
-			RelSymNotFound { source, name } => write!(f, "undefined symbol '{name}' (in {source}) (relocation ignored)."),
 			RelOOB(text, offset) => write!(f, "relocation applied to {text}+0x{offset:x}, which goes outside of the symbol (it will be ignored)."),
 			RelNoData(source, offset) => write!(
 				f,
 				"relocation {source}+0x{offset:x} not in a data/text section. it will be ignored."
 			),
-			RelNoValue(name) => write!(f, "can't figure out value of symbol '{name}' (relocation ignored)."),
 			RelUnsupported(x) => write!(f, "Unsupported relocation type {x} (relocation ignored)."),
 		}
 	}
@@ -70,16 +72,12 @@ impl From<&LinkWarning> for String {
 	}
 }
 
+/// error produced by [Linker::add_object]
 pub enum ObjectError {
+	/// ELF format error
 	Elf(elf::Error),
+	/// wrong type of ELF file
 	BadType,
-	BadUtf8,
-	BadSymtab,
-	BadLink(u64),
-	BadRelHeader,
-	UnsupportedRelocation(u8),
-	BadSymIdx(u64),
-	NoStrtab,
 }
 
 impl From<elf::Error> for ObjectError {
@@ -102,21 +100,16 @@ impl fmt::Display for ObjectError {
 			//  ("failed to fill whole buffer")
 			Elf(e) => write!(f, "{e}"),
 			BadType => write!(f, "wrong type of ELF file (not an object file)"),
-			BadUtf8 => write!(f, "bad UTF-8 in ELF file"),
-			BadSymtab => write!(f, "bad ELF symbol table"),
-			BadRelHeader => write!(f, "bad ELF relocation header"),
-			UnsupportedRelocation(x) => write!(f, "unsupported relocation type: {x}"),
-			BadLink(i) => write!(f, "bad ELF link: {i}"),
-			BadSymIdx(i) => write!(f, "bad symbol index: {i}"),
-			NoStrtab => write!(f, "object has no .strtab section"),
 		}
 	}
 }
 
-// to be more efficient™, we use integers to keep track of symbol names.
 type SymbolNameType = u32;
+/// To be more efficient™, we use integers to keep track of symbol names.
+/// A SymbolName doesn't need to refer to a symbol which has been defined.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 struct SymbolName(SymbolNameType);
+/// Keeps track of string-[SymbolName] conversion.
 struct SymbolNames {
 	count: SymbolNameType,
 	to_string: Vec<String>,
@@ -146,12 +139,10 @@ impl SymbolNames {
 		}
 	}
 
-	#[allow(dead_code)]
 	fn get_str(&self, id: SymbolName) -> Option<&str> {
 		self.to_string.get(id.0 as usize).map(|s| &s[..])
 	}
 
-	#[allow(dead_code)]
 	fn get(&self, name: &str) -> Option<SymbolName> {
 		self.by_string.get(name).copied()
 	}
@@ -168,14 +159,6 @@ type SymbolIdType = u32;
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 struct SymbolId(SymbolIdType);
 
-#[derive(Copy, Clone, Debug)]
-#[allow(dead_code)] // @TODO @TEMPORARY
-enum SymbolType {
-	Function,
-	Object,
-	Other,
-}
-
 #[derive(Debug)]
 enum SymbolValue {
 	Bss(u64),
@@ -183,12 +166,10 @@ enum SymbolValue {
 	Absolute(u64),
 }
 
-#[allow(dead_code)] // @TODO @TEMPORARY
 #[derive(Debug)]
 struct SymbolInfo {
-	r#type: elf::SymbolType,
-	value: Option<SymbolValue>,
-	size: u64,
+	// (currently this is all we need)
+	value: SymbolValue,
 }
 
 struct Symbols {
@@ -239,8 +220,8 @@ impl Symbols {
 		self.info.get_mut(id.0 as usize)
 	}
 
-	fn get_info_from_id(&self, id: SymbolId) -> Option<&SymbolInfo> {
-		self.info.get(id.0 as usize)
+	fn get_info_from_id(&self, id: SymbolId) -> &SymbolInfo {
+		self.info.get(id.0 as usize).expect("bad symbol ID")
 	}
 
 	fn get_id_from_name(&self, source: SourceId, name: SymbolName) -> Option<SymbolId> {
@@ -269,18 +250,18 @@ struct Relocation {
 	addend: i64,
 }
 
-pub struct Linker {
+pub struct Linker<'a> {
 	symbols: Symbols,
 	symbol_names: SymbolNames,
 	relocations: Vec<Relocation>,
 	undefined_relocations: Vec<Relocation>, // library relocations
-	sources: Vec<String>, // object files
+	sources: Vec<String>,                   // object files
 	libraries: Vec<String>,
 	bss_size: u64,                               // output bss size
 	bss_addr: u64,                               // output bss address
 	data_addr: u64,                              // output data address
 	symbol_data_offsets: HashMap<SymbolId, u64>, // for symbols with data, this holds the offsets into the data segment.
-	warn: fn(LinkWarning),
+	warn: Box<dyn Fn(LinkWarning) + 'a>,
 }
 
 // this maps between offsets in an object file and symbols defined in that file.
@@ -402,7 +383,7 @@ impl Executable {
 		self.load_addr + self.data_offset()
 	}
 
-	pub fn write<T: Write + Seek>(&self, data: &[u8], mut out: T) -> LinkResult<()> {
+	pub fn write(&self, data: &[u8], mut out: impl Write + Seek) -> LinkResult<()> {
 		let load_addr = self.load_addr as u32;
 
 		// start by writing data.
@@ -428,7 +409,7 @@ impl Executable {
 			let mut symbols: HashMap<SymbolName, u32> = HashMap::new();
 			for (i, (sym, strtab_offset)) in self.symbol_strtab_offsets.iter().enumerate() {
 				symbols.insert(*sym, (i + 1) as u32);
-				// @TODO: allow STT_OBJECT as fell
+				// @TODO: allow STT_OBJECT as well
 				let sym = elf::Sym32 {
 					name: *strtab_offset as u32,
 					info: elf::STB_GLOBAL << 4 | elf::STT_FUNC,
@@ -571,18 +552,15 @@ impl Executable {
 	}
 }
 
-impl Linker {
+impl<'a> Linker<'a> {
 	fn default_warn_handler(warning: LinkWarning) {
 		eprintln!("warning: {warning}");
 	}
 
-	// why use fn of all things to transmit warnings?
-	// well, it's very nice for stuff to not need a mutable reference
-	// to emit warnings, and this is basically the only way of doing it.
-	// if you need to mutate state in your warning handler, you can always
-	// use a mutex.
-	pub fn _set_warning_handler(&mut self, warn: fn(LinkWarning)) {
-		self.warn = warn;
+	/// Set function to be called when there is a warning.
+	/// By default, warnings are sent to stderr.
+	pub fn set_warning_handler<T: Fn(LinkWarning) + 'a>(&mut self, warn: T) {
+		self.warn = Box::new(warn);
 	}
 
 	pub fn new() -> Self {
@@ -597,7 +575,7 @@ impl Linker {
 			sources: vec![],
 			libraries: vec![],
 			symbol_data_offsets: HashMap::new(),
-			warn: Self::default_warn_handler,
+			warn: Box::new(Self::default_warn_handler),
 		}
 	}
 
@@ -626,31 +604,29 @@ impl Linker {
 						data_offset = Some(elf.section_offset(shndx).unwrap() + offset);
 						elf.read_section_data_exact(shndx, offset, &mut data)?;
 						Some(SymbolValue::Data(data))
-					},
+					}
 					Some(elf::SectionType::NoBits) => {
 						let p = self.bss_size;
 						self.bss_size += symbol.size;
 						Some(SymbolValue::Bss(p))
-					},
+					}
 					_ => None, // huh
 				}
 			}
 		};
 
-		let info = SymbolInfo {
-			r#type: symbol.r#type,
-			value,
-			size: symbol.size,
-		};
-		let symbol_id = match symbol.bind {
-			elf::SymbolBind::Local => self.symbols.add_local(source, name_id, info),
-			elf::SymbolBind::Global => self.symbols.add_global(source, name_id, info),
-			elf::SymbolBind::Weak => self.symbols.add_weak(source, name_id, info),
-			_ => return Ok(()), // eh
-		};
+		if let Some(value) = value {
+			let info = SymbolInfo { value };
+			let symbol_id = match symbol.bind {
+				elf::SymbolBind::Local => self.symbols.add_local(source, name_id, info),
+				elf::SymbolBind::Global => self.symbols.add_global(source, name_id, info),
+				elf::SymbolBind::Weak => self.symbols.add_weak(source, name_id, info),
+				_ => return Ok(()), // eh
+			};
 
-		if let Some(offset) = data_offset {
-			offset_map.add_symbol(offset, symbol.size, symbol_id);
+			if let Some(offset) = data_offset {
+				offset_map.add_symbol(offset, symbol.size, symbol_id);
+			}
 		}
 		Ok(())
 	}
@@ -674,11 +650,11 @@ impl Linker {
 		if elf.r#type() != elf::Type::Rel {
 			return Err(BadType);
 		}
-		
+
 		for symbol in elf.symbols() {
 			self.add_symbol(source_id, &elf, &mut offset_map, symbol)?;
 		}
-		
+
 		for rel in elf.relocations() {
 			if let Some(r#where) = offset_map.get(rel.offset) {
 				let sym = self.symbol_names.add(elf.symbol_name(&rel.symbol)?);
@@ -692,14 +668,14 @@ impl Linker {
 			} else {
 				self.emit_warning(LinkWarning::RelNoData(
 					self.source_name(source_id).into(),
-					rel.entry_offset
+					rel.entry_offset,
 				));
 			}
 		}
 
 		Ok(())
 	}
-	
+
 	pub fn add_library(&mut self, name: &str) -> Result<(), ObjectError> {
 		self.libraries.push(name.into());
 		Ok(())
@@ -713,22 +689,10 @@ impl Linker {
 		(self.warn)(warning);
 	}
 
-	fn emit_warning_rel_sym_not_found(&self, source: SourceId, name: SymbolName) {
-		let warn = LinkWarning::RelSymNotFound {
-			source: self.source_name(source).into(),
-			name: self.symbol_name_str(name).into(),
-		};
-		self.emit_warning(warn);
-	}
-
-	// get symbol ID, producing a warning if it does not exist.
+	/// get symbol ID from symbol name
+	/// returns 0 if the ssymbol is not defined.
 	fn get_symbol_id(&self, source_id: SourceId, name: SymbolName) -> Option<SymbolId> {
-		// @TODO: don't warn about the same symbol twice
-		let sym = self.symbols.get_id_from_name(source_id, name);
-		if sym.is_none() {
-			self.emit_warning_rel_sym_not_found(source_id, name);
-		}
-		sym
+		self.symbols.get_id_from_name(source_id, name)
 	}
 
 	// generates a string like main.c:some_function
@@ -743,16 +707,19 @@ impl Linker {
 		"???".into()
 	}
 
-	fn get_symbol_value(&self, sym: SymbolId) -> Option<u64> {
-		let info = self.symbols.get_info_from_id(sym)?;
+	fn get_symbol_value(&self, sym: SymbolId) -> u64 {
+		let info = self.symbols.get_info_from_id(sym);
 		use SymbolValue::*;
-		match info.value.as_ref()? {
-			Data(_) => self
+		match info.value {
+			Data(_) => {
+				self
 				.symbol_data_offsets
 				.get(&sym)
-				.map(|&o| o + self.data_addr),
-			Bss(x) => Some(self.bss_addr + *x),
-			Absolute(a) => Some(*a),
+				.unwrap() // @TODO: can this panic?
+				+ self.data_addr
+			}
+			Bss(x) => self.bss_addr + x,
+			Absolute(a) => a,
 		}
 	}
 
@@ -771,19 +738,15 @@ impl Linker {
 		let pc = apply_offset + self.data_addr;
 
 		let symbol = match self.get_symbol_id(rel.source_id, rel.sym) {
-			None => return Ok(()), // we emitted a warning in get_symbol_id
-			Some(sym) => sym,
-		};
-
-		let symbol_value = match self.get_symbol_value(symbol) {
 			None => {
-				// this symbol is defined in a library
-				//self.emit_warning(LinkWarning::RelNoValue(self.symbol_id_location_string(symbol)));
+				// symbol not defined. it should come from a library.
 				self.undefined_relocations.push(rel);
 				return Ok(());
 			}
-			Some(v) => v,
+			Some(sym) => sym,
 		};
+
+		let symbol_value = self.get_symbol_value(symbol);
 
 		let addend = rel.addend;
 
@@ -796,17 +759,16 @@ impl Linker {
 		let value = match rel.r#type {
 			Direct32 => U32(symbol_value as u32 + addend as u32),
 			Pc32 => U32(symbol_value as u32 + addend as u32 - pc as u32),
-			Other(x) => {self.emit_warning(LinkWarning::RelUnsupported(x)); return Ok(()) },
-		};
-
-		let apply_symbol_info = match self.symbols.get_mut_info_from_id(apply_symbol) {
-			Some(info) => info,
-			None => {
-				// this shouldn't happen.
-				self.emit_warning_rel_sym_not_found(rel.source_id, rel.sym);
+			Other(x) => {
+				self.emit_warning(LinkWarning::RelUnsupported(x));
 				return Ok(());
 			}
 		};
+
+		let apply_symbol_info = self
+			.symbols
+			.get_mut_info_from_id(apply_symbol)
+			.expect("bad symbol ID");
 
 		use SymbolValue::*;
 
@@ -814,7 +776,7 @@ impl Linker {
 		let apply_start = apply_offset.try_into().unwrap_or(usize::MAX - 32);
 
 		match apply_symbol_info.value {
-			Some(Data(_)) => {
+			Data(_) => {
 				let mut in_bounds = true;
 				match value {
 					U32(u) => {
@@ -844,7 +806,7 @@ impl Linker {
 
 		Ok(())
 	}
-	
+
 	/// "easy" input API.
 	/// infers the file type of input, and calls the appropriate function (e.g. `add_object`)
 	/// if there return value is `Err(s)`, `s` will be a nicely formatted error string.
@@ -852,11 +814,11 @@ impl Linker {
 		enum FileType {
 			Object,
 			DynamicLibrary,
-			Other
+			Other,
 		}
-		
+
 		use FileType::*;
-		
+
 		fn file_type(input: &str) -> FileType {
 			if input.ends_with(".o") {
 				return Object;
@@ -864,31 +826,27 @@ impl Linker {
 			if input.ends_with(".so") {
 				return DynamicLibrary;
 			}
-			if input.find(".so.").is_some() {
+			if input.contains(".so.") {
 				// e.g. libc.so.6, some_library.so.12.7.3
 				return DynamicLibrary;
 			}
 			Other
 		}
-		
+
 		match file_type(input) {
 			Object => {
-				let file = fs::File::open(input)
-					.map_err(|e| format!("Error opening {input}: {e}"))?;
+				let file =
+					fs::File::open(input).map_err(|e| format!("Couldn't open {input}: {e}"))?;
 				let mut file = io::BufReader::new(file);
 				self.add_object(input, &mut file)
-					.map_err(|e| format!("Error processing object file {input}: {e}"))
-			},
-			DynamicLibrary => {
-				self.add_library(input)
-					.map_err(|e| format!("Error processing library file {input}: {e}"))
-			},
-			Other => {
-				Err(format!("Unrecognized file type: {input}"))
+					.map_err(|e| format!("Failed to process object file {input}: {e}"))
 			}
+			DynamicLibrary => self
+				.add_library(input)
+				.map_err(|e| format!("Failed to process library file {input}: {e}")),
+			Other => Err(format!("Unrecognized file type: {input}")),
 		}
 	}
-
 
 	// we don't want to link unused symbols.
 	// we start by calling this on the entry function, then it recursively calls itself for each symbol used.
@@ -903,13 +861,12 @@ impl Linker {
 			return Ok(());
 		}
 
-		if let Some(info) = self.symbols.get_info_from_id(id) {
-			if let Some(SymbolValue::Data(d)) = &info.value {
-				// set address
-				self.symbol_data_offsets.insert(id, data.len() as u64);
-				// add data
-				data.extend(d);
-			}
+		let info = self.symbols.get_info_from_id(id);
+		if let SymbolValue::Data(d) = &info.value {
+			// set address
+			self.symbol_data_offsets.insert(id, data.len() as u64);
+			// add data
+			data.extend(d);
 		}
 
 		for reference in symbol_graph.get(&id).unwrap_or(&vec![]) {
@@ -919,11 +876,11 @@ impl Linker {
 		Ok(())
 	}
 
-	pub fn link<T: Write + Seek>(mut self, out: T, entry: &str) -> LinkResult<()> {
+	pub fn link(mut self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
 		let mut symbol_graph = SymbolGraph::with_capacity(self.symbols.count());
-		
+
 		let relocations = mem::take(&mut self.relocations);
-		
+
 		// compute symbol graph
 		for rel in relocations.iter() {
 			use std::collections::hash_map::Entry;
@@ -949,7 +906,7 @@ impl Linker {
 		for lib in self.libraries.iter() {
 			exec.add_lib(lib);
 		}
-		
+
 		self.data_addr = exec.data_addr();
 
 		let entry_name_id = self
@@ -976,26 +933,31 @@ impl Linker {
 
 		exec.write(&data, out)
 	}
-	
+
 	/// "easy" linking API.
-	pub fn link_to_file<P: AsRef<path::Path>>(self, path: P, entry: &str) -> Result<(), String> {
+	pub fn link_to_file(self, path: impl AsRef<path::Path>, entry: &str) -> Result<(), String> {
 		let path = path.as_ref();
 		let mut out_options = fs::OpenOptions::new();
-		out_options
-			.write(true)
-			.create(true)
-			.truncate(true);
+		out_options.write(true).create(true).truncate(true);
 		#[cfg(unix)]
 		{
 			use std::os::unix::fs::OpenOptionsExt;
 			out_options.mode(0o755);
 		}
-		
-		let output = out_options.open(path)
+
+		let output = out_options
+			.open(path)
 			.map_err(|e| format!("Error opening output file {}: {e}", path.to_string_lossy()))?;
 		let mut output = io::BufWriter::new(output);
-	
+
 		self.link(&mut output, entry)
 			.map_err(|e| format!("Error linking {}: {e}", path.to_string_lossy()))
+	}
+}
+
+impl<'a> Default for Linker<'a> {
+	/// mostly so clippy doesn't complain
+	fn default() -> Self {
+		Self::new()
 	}
 }

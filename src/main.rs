@@ -9,8 +9,8 @@ use clap::Parser;
 compile_error! {"WHY do you have a big endian machine???? it's the 21st century, buddy. this program won't work fuck you"}
 
 mod elf;
+pub mod linker;
 mod util;
-mod linker;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -29,21 +29,29 @@ struct Args {
 	entry: String,
 	/// :3
 	#[arg(long = "nya")]
-	nya: bool
+	nya: bool,
 }
 
 fn main_() -> Result<(), String> {
 	let args = Args::parse();
-	
+
 	if args.nya {
 		println!("hai uwu ^_^");
 		return Ok(());
 	}
-	
+
 	let inputs = &args.inputs;
-	
+
 	let mut linker = linker::Linker::new();
-	
+
+	let warning_handler = |w| {
+		// termcolor is a goddamn nightmare to use
+		// I DONT FUCKING CARE IF WRITING TO STDOUT FAILS
+		// DONT MAKE ME UNWRAP EVERYTHING
+		eprintln!("\x1b[93mwarning:\x1b[0m {w}");
+	};
+	linker.set_warning_handler(warning_handler);
+
 	if inputs.is_empty() {
 		if cfg!(debug_assertions) {
 			// ease of use when debugging
@@ -53,7 +61,6 @@ fn main_() -> Result<(), String> {
 		}
 	}
 
-	
 	if !args.no_std_lib {
 		linker.add_input("libc.so.6")?;
 	}
@@ -61,13 +68,12 @@ fn main_() -> Result<(), String> {
 	for input in inputs.iter() {
 		linker.add_input(input)?;
 	}
-	
+
 	linker.link_to_file(&args.output, &args.entry)
 }
 
 fn main() {
 	if let Err(e) = main_() {
-		eprintln!("{e}");
+		eprintln!("\x1b[91merror:\x1b[0m {e}");
 	}
 }
-
