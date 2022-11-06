@@ -1,3 +1,15 @@
+/*!
+Linker producing small executables.
+
+Example usage:
+```
+let mut linker = Linker::new();
+linker.add_input("main.o")?;
+linker.add_input("libc.so.6")?;
+linker.link_to_file("a.out")?;
+```
+*/
+
 use crate::{elf, util};
 use io::{BufRead, Seek, Write};
 use std::collections::{BTreeMap, HashMap};
@@ -579,6 +591,7 @@ impl<'a> Linker<'a> {
 		}
 	}
 
+	/// Get name of source file.
 	fn source_name(&self, id: SourceId) -> &str {
 		&self.sources[id.0 as usize]
 	}
@@ -676,26 +689,30 @@ impl<'a> Linker<'a> {
 		Ok(())
 	}
 
+	/// Add a dynamic library (.so). `name` can be a full path or
+	/// something like "libc.so.6".
 	pub fn add_library(&mut self, name: &str) -> Result<(), ObjectError> {
 		self.libraries.push(name.into());
 		Ok(())
 	}
 
+	/// Get name of symbol if possible.
 	fn symbol_name_str(&self, id: SymbolName) -> &str {
 		self.symbol_names.get_str(id).unwrap_or("???")
 	}
 
+	/// Do a warning.
 	fn emit_warning(&self, warning: LinkWarning) {
 		(self.warn)(warning);
 	}
 
-	/// get symbol ID from symbol name
-	/// returns 0 if the ssymbol is not defined.
+	/// Get symbol ID from symbol name.
+	/// Returns `None` if the symbol is not defined.
 	fn get_symbol_id(&self, source_id: SourceId, name: SymbolName) -> Option<SymbolId> {
 		self.symbols.get_id_from_name(source_id, name)
 	}
 
-	// generates a string like main.c:some_function
+	/// Generates a string like main.c:some_function.
 	fn symbol_id_location_string(&self, id: SymbolId) -> String {
 		if let Some((source, name)) = self.symbols.get_location_from_id(id) {
 			return format!(
@@ -707,6 +724,7 @@ impl<'a> Linker<'a> {
 		"???".into()
 	}
 
+	/// Get value of symbol (e.g. ID of main → address of main).
 	fn get_symbol_value(&self, sym: SymbolId) -> u64 {
 		let info = self.symbols.get_info_from_id(sym);
 		use SymbolValue::*;
@@ -723,13 +741,15 @@ impl<'a> Linker<'a> {
 		}
 	}
 
+	/// Get offset in data section where relocation should be applied.
 	fn get_rel_apply_data_offset(&self, rel: &Relocation) -> Option<u64> {
 		let apply_symbol = rel.r#where.0;
 		let r = self.symbol_data_offsets.get(&apply_symbol)?;
 		Some(*r + rel.r#where.1)
 	}
 
-	fn apply_relocation(&mut self, rel: Relocation, data: &mut [u8]) -> Result<(), LinkError> {
+	/// Apply relocation to data.
+	fn apply_relocation(&mut self, rel: Relocation, data: &mut [u8]) -> LinkResult<()> {
 		let apply_symbol = rel.r#where.0;
 		let apply_offset = match self.get_rel_apply_data_offset(&rel) {
 			Some(data_offset) => data_offset,
@@ -807,9 +827,8 @@ impl<'a> Linker<'a> {
 		Ok(())
 	}
 
-	/// "easy" input API.
-	/// infers the file type of input, and calls the appropriate function (e.g. `add_object`)
-	/// if there return value is `Err(s)`, `s` will be a nicely formatted error string.
+	/// Easy input API.
+	/// Infers the file type of input, and calls the appropriate function (e.g. [Self::add_object]).
 	pub fn add_input(&mut self, input: &str) -> Result<(), String> {
 		enum FileType {
 			Object,
@@ -876,6 +895,9 @@ impl<'a> Linker<'a> {
 		Ok(())
 	}
 
+	/// Link everything together.
+	/// Currently this drops `self` (you probably don't need to link multiple times).
+	/// That might change in a future version.
 	pub fn link(mut self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
 		let mut symbol_graph = SymbolGraph::with_capacity(self.symbols.count());
 
@@ -934,7 +956,7 @@ impl<'a> Linker<'a> {
 		exec.write(&data, out)
 	}
 
-	/// "easy" linking API.
+	/// Easy linking API. Just provide a path.
 	pub fn link_to_file(self, path: impl AsRef<path::Path>, entry: &str) -> Result<(), String> {
 		let path = path.as_ref();
 		let mut out_options = fs::OpenOptions::new();
