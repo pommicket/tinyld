@@ -160,6 +160,7 @@ impl SymbolNames {
 	}
 }
 
+/// A source is a file where symbols are defined (currently only object files).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 struct SourceId(u32);
 
@@ -168,27 +169,40 @@ impl SourceId {
 }
 
 type SymbolIdType = u32;
+//// A symbol ID refers to a symbol *which has a definition*, unlike [SymbolName].
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 struct SymbolId(SymbolIdType);
 
+/// Value of a symbol.
 #[derive(Debug)]
 enum SymbolValue {
+	/// We make one big BSS section, this is an offset into it.
 	Bss(u64),
+	/// Data associated with this symbol (machine code for functions,
+	/// bytes making up string literals, etc.)
 	Data(Vec<u8>),
+	/// An absolute value. This corresponds to relocations with
+	/// `shndx == SHN_ABS`.
 	Absolute(u64),
 }
 
+/// Information about a defined symbol.
 #[derive(Debug)]
 struct SymbolInfo {
-	// (currently this is all we need)
 	value: SymbolValue,
 }
 
+/// information about all symbols in all sources
 struct Symbols {
+	/// info[n] = symbol info corresponding to ID #n
 	info: Vec<SymbolInfo>,
+	/// mapping from symbol ID to source where it was defined + symbol name
 	locations: HashMap<SymbolId, (SourceId, SymbolName)>,
+	/// all global symbols
 	global: HashMap<SymbolName, SymbolId>,
+	/// all weak symbols (weak symbols are like global symbols but have lower precedence)
 	weak: HashMap<SymbolName, SymbolId>,
+	/// all local symbols
 	local: HashMap<(SourceId, SymbolName), SymbolId>,
 }
 
@@ -227,15 +241,21 @@ impl Symbols {
 		self.global.insert(name, id);
 		id
 	}
-
-	fn get_mut_info_from_id(&mut self, id: SymbolId) -> Option<&mut SymbolInfo> {
-		self.info.get_mut(id.0 as usize)
-	}
-
+	
 	fn get_info_from_id(&self, id: SymbolId) -> &SymbolInfo {
+		// Self::add_ is the only function that constructs SymbolIds.
+		// unless someone uses a SymbolId across Symbols instances (why would you do that),
+		// this should never panic.
 		self.info.get(id.0 as usize).expect("bad symbol ID")
 	}
 
+	/// Get symbol ID from source and symbol name. The source ID is needed
+	/// for local symbols -- to find a global symbol with a given name you can
+	/// pass in [SymbolID::NONE].
+	///
+	/// The precedence rules according to ELF are: local then global then weak.
+	///
+	/// Returns `None` if the symbol hasn't been defined.
 	fn get_id_from_name(&self, source: SourceId, name: SymbolName) -> Option<SymbolId> {
 		self.local
 			.get(&(source, name))
@@ -244,19 +264,24 @@ impl Symbols {
 			.copied()
 	}
 
-	fn get_location_from_id(&self, id: SymbolId) -> Option<(SourceId, SymbolName)> {
-		self.locations.get(&id).copied()
+	fn get_location_from_id(&self, id: SymbolId) -> (SourceId, SymbolName) {
+		*self.locations.get(&id).expect("bad symbol ID")
 	}
 
+	/// Number of defined symbols.
 	fn count(&self) -> usize {
 		self.info.len()
 	}
 }
 
+/// An ELF relocation.
 #[derive(Debug, Clone)]
 struct Relocation {
-	r#where: (SymbolId, u64), // (symbol containing relocation, offset in symbol where relocation needs to be applied)
+	/// (symbol containing relocation, offset in symbol where relocation needs to be applied)
+	r#where: (SymbolId, u64),
+	/// which source is asking for this relocation
 	source_id: SourceId,
+	/// symbol that needs to be supplied
 	sym: SymbolName,
 	r#type: elf::RelType,
 	addend: i64,
@@ -266,7 +291,6 @@ pub struct Linker<'a> {
 	symbols: Symbols,
 	symbol_names: SymbolNames,
 	relocations: Vec<Relocation>,
-	undefined_relocations: Vec<Relocation>, // library relocations
 	sources: Vec<String>,                   // object files
 	libraries: Vec<String>,
 	bss_size: u64,                               // output bss size
@@ -583,7 +607,6 @@ impl<'a> Linker<'a> {
 			bss_size: 0,
 			data_addr: 0,
 			relocations: vec![],
-			undefined_relocations: vec![],
 			sources: vec![],
 			libraries: vec![],
 			symbol_data_offsets: HashMap::new(),
@@ -714,14 +737,12 @@ impl<'a> Linker<'a> {
 
 	/// Generates a string like main.c:some_function.
 	fn symbol_id_location_string(&self, id: SymbolId) -> String {
-		if let Some((source, name)) = self.symbols.get_location_from_id(id) {
-			return format!(
-				"{}:{}",
-				self.source_name(source),
-				self.symbol_name_str(name)
-			);
-		}
-		"???".into()
+		let (source, name) = self.symbols.get_location_from_id(id);
+		format!(
+			"{}:{}",
+			self.source_name(source),
+			self.symbol_name_str(name)
+		)
 	}
 
 	/// Get value of symbol (e.g. ID of main → address of main).
@@ -749,19 +770,20 @@ impl<'a> Linker<'a> {
 	}
 
 	/// Apply relocation to data.
-	fn apply_relocation(&mut self, rel: Relocation, data: &mut [u8]) -> LinkResult<()> {
+	/// Returns `Ok(true)` if the relocation was dealt with, and
+	/// `Ok(false)` if the symbol is not defined (so it needs to be loaded from a dynamic library).
+	fn apply_relocation(&self, rel: &Relocation, data: &mut [u8]) -> LinkResult<bool> {
 		let apply_symbol = rel.r#where.0;
 		let apply_offset = match self.get_rel_apply_data_offset(&rel) {
 			Some(data_offset) => data_offset,
-			None => return Ok(()), // this relocation isn't in a data section so there's nothing we can do about it
+			None => return Ok(true), // this relocation isn't in a data section so there's nothing we can do about it
 		};
 		let pc = apply_offset + self.data_addr;
-
+		
 		let symbol = match self.get_symbol_id(rel.source_id, rel.sym) {
 			None => {
 				// symbol not defined. it should come from a library.
-				self.undefined_relocations.push(rel);
-				return Ok(());
+				return Ok(false);
 			}
 			Some(sym) => sym,
 		};
@@ -781,19 +803,16 @@ impl<'a> Linker<'a> {
 			Pc32 => U32(symbol_value as u32 + addend as u32 - pc as u32),
 			Other(x) => {
 				self.emit_warning(LinkWarning::RelUnsupported(x));
-				return Ok(());
+				return Ok(true);
 			}
 		};
 
-		let apply_symbol_info = self
-			.symbols
-			.get_mut_info_from_id(apply_symbol)
-			.expect("bad symbol ID");
+		let apply_symbol_info = self.symbols.get_info_from_id(apply_symbol);
 
 		use SymbolValue::*;
 
 		// guarantee failure if apply_offset can't be converted to usize.
-		let apply_start = apply_offset.try_into().unwrap_or(usize::MAX - 32);
+		let apply_start = apply_offset.try_into().unwrap_or(usize::MAX - 1000);
 
 		match apply_symbol_info.value {
 			Data(_) => {
@@ -824,7 +843,7 @@ impl<'a> Linker<'a> {
 			}
 		}
 
-		Ok(())
+		Ok(true)
 	}
 
 	/// Easy input API.
@@ -901,10 +920,8 @@ impl<'a> Linker<'a> {
 	pub fn link(mut self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
 		let mut symbol_graph = SymbolGraph::with_capacity(self.symbols.count());
 
-		let relocations = mem::take(&mut self.relocations);
-
 		// compute symbol graph
-		for rel in relocations.iter() {
+		for rel in self.relocations.iter() {
 			use std::collections::hash_map::Entry;
 			if let Some(symbol) = self.get_symbol_id(rel.source_id, rel.sym) {
 				let apply_symbol = rel.r#where.0;
@@ -943,16 +960,15 @@ impl<'a> Linker<'a> {
 		let mut data = vec![];
 		self.add_data_for_symbol(&mut data, &symbol_graph, entry_id)?;
 
-		for rel in relocations {
-			self.apply_relocation(rel, &mut data)?;
-		}
-
-		for rel in mem::take(&mut self.undefined_relocations) {
-			if let Some(data_offset) = self.get_rel_apply_data_offset(&rel) {
-				exec.add_relocation(&self.symbol_names, &rel, self.data_addr + data_offset);
+		for rel in self.relocations.iter() {
+			if !self.apply_relocation(rel, &mut data)? {
+				// dynamic library relocation
+				if let Some(data_offset) = self.get_rel_apply_data_offset(rel) {
+					exec.add_relocation(&self.symbol_names, rel, self.data_addr + data_offset);
+				}
 			}
 		}
-
+		
 		exec.write(&data, out)
 	}
 
