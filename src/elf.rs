@@ -529,19 +529,32 @@ impl Reader for Reader32LE {
 					let mut sym_buf = [0; 16];
 					reader.read_exact(&mut sym_buf)?;
 					let sym = Sym32::from_bytes(sym_buf);
+					let r#type = (sym.info & 0xf).into();
+					let bind = (sym.info >> 4).into();
+					let mut size = sym.size.into();
+					
 					let value = match sym.shndx {
 						SHN_UNDEF => SymbolValue::Undefined,
 						SHN_ABS => SymbolValue::Absolute(sym.value.into()),
-						idx if idx < ehdr.shnum => SymbolValue::SectionOffset(idx, sym.value.into()),
+						idx if idx < ehdr.shnum => {
+							if r#type == SymbolType::Section {
+								// section symbols have a size of 0, it seems.
+								// i don't know why they don't just use the size of the section.
+								// i'm replacing it here. it makes the code easier to write.
+								size = shdrs[idx as usize].size.into();
+							}
+							SymbolValue::SectionOffset(idx, sym.value.into())
+						},
 						x => return Err(BadSymShNdx(x)),
 					};
+					
 					
 					let symbol = Symbol {
 						name: sym.name.into(),
 						value,
-						r#type: (sym.info & 0xf).into(),
-						bind: (sym.info >> 4).into(),
-						size: sym.size.into(),
+						r#type,
+						bind,
+						size,
 					};
 					symtab.push(symbols.len());
 					symbols.push(symbol);

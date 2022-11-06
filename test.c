@@ -2,10 +2,9 @@
 #include <stdlib.h>
 
 int x;
-void main() {
-	puts("HellO");
-	puts("there");
+void entry() {
+	puts("Hello, world!");
 	//printf("hello\n");
-	exit(123);
+	exit(0);
 	    
 }
