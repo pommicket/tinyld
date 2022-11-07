@@ -857,16 +857,17 @@ impl<'a> Linker<'a> {
 		symbol: &elf::Symbol,
 	) -> Result<(), ObjectError> {
 		let name = elf.symbol_name(symbol)?;
+//		let dbg_name = name.clone();
 		let name_id = self.symbol_names.add(name);
 		let size = symbol.size;
 		
 		let value = match symbol.value {
 			elf::SymbolValue::Undefined => None,
 			elf::SymbolValue::Absolute(n) => Some(SymbolValue::Absolute(n)),
-			elf::SymbolValue::SectionOffset(shndx, offset) => {
+			elf::SymbolValue::SectionOffset(shndx, sec_offset) => {
 				match elf.section_type(shndx) {
 					Some(elf::SectionType::ProgBits) => {
-						let offset = elf.section_offset(shndx).unwrap() + offset;
+						let offset = elf.section_offset(shndx).unwrap() + sec_offset;
 						Some(SymbolValue::Data { source, offset, size })
 					}
 					Some(elf::SectionType::NoBits) => {
@@ -1117,6 +1118,7 @@ impl<'a> Linker<'a> {
 				if let Some(symbol) = self.get_symbol_id(rel.r#where.0, rel.sym) {
 					let value = &self.symbols.get_info_from_id(symbol).value;
 					if let SymbolValue::Data { source: req_source, offset: req_offset, size: req_size } = value {
+						// @TODO: check addend
 						self.require_range(ranges, *req_source, *req_offset, *req_size)
 					} // else, it's okay, it's a bss relocation or something hopefully
 				} // else, we'll deal with it in apply_relocation
@@ -1166,14 +1168,12 @@ impl<'a> Linker<'a> {
 			let dest_end = dest_start + size as usize;
 			let src_start = src_offset as usize;
 			let src_end = src_start + size as usize;
-			let dest_addr = dest_offset + exec.data_addr();
-			println!("{source:?}@{src_offset:x} => {:x}..{:x}", dest_addr,dest_addr+size); 
+			//let dest_addr = dest_offset + exec.data_addr();
+			//println!("{source:?}@{src_offset:x} => {:x}..{:x}", dest_addr,dest_addr+size); 
 			data_section[dest_start..dest_end].copy_from_slice(
 				&self.source_data[source.0 as usize][src_start..src_end]
 			);
 		});
-		
-		println!("{:?}", data_section);
 		
 		exec.set_data(data_section);
 		
@@ -1182,7 +1182,6 @@ impl<'a> Linker<'a> {
 				self.apply_relocation(&mut exec, &offset_map, rel)?;
 			}
 		}
-		println!("{:?}", exec.data);
 
 		// this should never panic, since we did require_range on the entry point.
 		let entry_addr = offset_map.translate_offset(entry_source, entry_offset).unwrap() + exec.data_addr();

@@ -396,7 +396,7 @@ pub enum SymbolValue {
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
-	name: u64, // offset into .strtab
+	name: String,
 	pub size: u64,
 	pub value: SymbolValue,
 	pub bind: SymbolBind,
@@ -467,8 +467,6 @@ pub struct Reader32LE {
 	ehdr: Ehdr32,
 	shdrs: Vec<Shdr32>,
 	symbols: Vec<Symbol>,
-	/// index of .strtab section
-	strtab_idx: Option<u16>,
 	/// All data in the file.
 	/// We put it all in memory.
 	/// Object files usually aren't huge or anything.
@@ -528,6 +526,9 @@ impl Reader for Reader32LE {
 		let mut symbols = vec![];
 		let mut strtab_idx = None;
 
+		let mut section_names = Vec::with_capacity(ehdr.shnum.into());
+
+		// read section names, find .strtab
 		for (s_idx, shdr) in shdrs.iter().enumerate() {
 			if let Some(shstrhdr) = shdrs.get(ehdr.shstrndx as usize) {
 				// get name
@@ -538,13 +539,16 @@ impl Reader for Reader32LE {
 				reader.read_until(0, &mut bytes)?;
 				bytes.pop(); // remove terminating \0
 				let name = bytes_to_string(bytes)?;
-
 				if name == ".strtab" {
-					// since shdrs.len() == ehdr.shnum, this should never panic.
-					strtab_idx = Some(s_idx.try_into().unwrap());
+					strtab_idx = Some(s_idx);
 				}
-			}
+				
+				section_names.push(name);
 
+			}
+		}
+		
+		for shdr in shdrs.iter() {
 			let mut symtab = vec![];
 			if shdr.r#type == SHT_SYMTAB && shdr.entsize as usize >= mem::size_of::<Sym32>() {
 				// read symbol table
@@ -566,15 +570,36 @@ impl Reader for Reader32LE {
 								// section symbols have a size of 0, it seems.
 								// i don't know why they don't just use the size of the section.
 								// i'm replacing it here. it makes the code easier to write.
-								size = shdrs[idx as usize].size.into();
+								size = shdrs[usize::from(idx)].size.into();
 							}
 							SymbolValue::SectionOffset(idx, sym.value.into())
 						}
 						x => return Err(BadSymShNdx(x)),
 					};
-
+					
+					let mut name = {
+						let strtab_offset = shdrs[strtab_idx.ok_or(Error::NoStrtab)?].offset;
+						let strtab = &data.get(strtab_offset as usize..)
+							.ok_or(Error::NoStrtab)?;
+						let i = sym.name as usize;
+						let mut end = i;
+						while end < strtab.len() && strtab[end] != b'\0' {
+							end += 1;
+						}
+						bytes_to_string(strtab[i..end].to_vec())?
+					};
+					
+					if name.is_empty() {
+						if r#type == SymbolType::Section {
+							// section symbols have empty names.
+							// this makes sense, since you don't want to repeat the strings in .strtab and .shstrtab
+							// but i don't know why .strtab and .shstrtab are separate....
+							name = section_names[usize::from(sym.shndx)].clone();
+						}
+					}
+					
 					let symbol = Symbol {
-						name: sym.name.into(),
+						name,
 						value,
 						r#type,
 						bind,
@@ -652,7 +677,6 @@ impl Reader for Reader32LE {
 			ehdr,
 			shdrs,
 			symbols,
-			strtab_idx,
 			relocations,
 			data,
 		})
@@ -679,15 +703,7 @@ impl Reader for Reader32LE {
 	}
 
 	fn symbol_name(&self, sym: &Symbol) -> Result<String> {
-		let strtab_offset = self.shdrs[usize::from(self.strtab_idx.ok_or(Error::NoStrtab)?)].offset;
-		let strtab = &self.data.get(strtab_offset as usize..)
-			.ok_or(Error::NoStrtab)?;
-		let i = sym.name as usize;
-		let mut end = i;
-		while end < strtab.len() && strtab[end] != b'\0' {
-			end += 1;
-		}
-		bytes_to_string(strtab[i..end].to_vec())
+		Ok(sym.name.clone())
 	}
 
 	fn section_type(&self, idx: u16) -> Option<SectionType> {
