@@ -302,6 +302,8 @@ struct Relocation {
 	/// symbol that needs to be supplied
 	sym: SymbolName,
 	r#type: elf::RelType,
+	/// type of `sym`
+	symbol_type: elf::SymbolType,
 	addend: i64,
 }
 
@@ -400,8 +402,10 @@ struct LinkerOutput {
 	relocations: Vec<(Relocation, u64)>,
 	/// contents of dynamic strtab.
 	strtab: Vec<u8>,
-	/// offsets into dynamic strtab where symbol names appear.
-	symbol_strtab_offsets: HashMap<SymbolName, u64>,
+	/// (offset into strtab, type) 
+	/// Seems like no one sets the type of undefined symbols.
+	/// Still, might as well pretend they do.
+	dynsyms: HashMap<SymbolName, (u64, elf::SymbolType)>,
 	/// array of stratb pointers to library names.
 	lib_strtab_offsets: Vec<u64>,
 }
@@ -416,7 +420,7 @@ impl LinkerOutput {
 			interp: vec![],
 			relocations: vec![],
 			lib_strtab_offsets: vec![],
-			symbol_strtab_offsets: HashMap::new(),
+			dynsyms: HashMap::new(),
 			strtab: vec![0],
 		}
 	}
@@ -450,10 +454,10 @@ impl LinkerOutput {
 	pub fn add_relocation(&mut self, symbol_names: &SymbolNames, rel: &Relocation, addr: u64) {
 		let name = rel.sym;
 
-		if self.symbol_strtab_offsets.get(&name).is_none() {
+		if self.dynsyms.get(&name).is_none() {
 			let s = symbol_names.get_str(name).unwrap();
 			let offset = self.add_string(s);
-			self.symbol_strtab_offsets.insert(name, offset);
+			self.dynsyms.insert(name, (offset, rel.symbol_type));
 		}
 		self.relocations.push((rel.clone(), addr));
 	}
@@ -559,12 +563,11 @@ impl LinkerOutput {
 			let null_symbol = [0; mem::size_of::<elf::Sym32>()];
 			out.write_all(&null_symbol)?;
 			let mut symbols: HashMap<SymbolName, u32> = HashMap::new();
-			for (i, (sym, strtab_offset)) in self.symbol_strtab_offsets.iter().enumerate() {
+			for (i, (sym, (strtab_offset, symbol_type))) in self.dynsyms.iter().enumerate() {
 				symbols.insert(*sym, (i + 1) as u32);
-				// @TODO: allow STT_OBJECT as well
 				let sym = elf::Sym32 {
 					name: *strtab_offset as u32,
-					info: elf::STB_GLOBAL << 4 | elf::STT_FUNC,
+					info: elf::STB_GLOBAL << 4 | u8::from(*symbol_type),
 					value: 0,
 					size: 0,
 					other: 0,
@@ -812,6 +815,7 @@ impl<'a> Linker<'a> {
 					r#where,
 					source_id,
 					sym,
+					symbol_type: rel.symbol.r#type,
 					r#type: rel.r#type,
 					addend: rel.addend,
 				});

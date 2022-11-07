@@ -1,9 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-int x;
-void entry() {
-	puts("Hello, world!");
+extern int errno;
+int main() {
+	errno = 0;
+	fopen("zzz","r");
+	printf("%d\n",errno);
 	//printf("hello\n");
 	exit(0);
 	    

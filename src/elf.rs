@@ -373,6 +373,18 @@ impl From<u8> for SymbolType {
 	}
 }
 
+impl From<SymbolType> for u8 {
+	fn from(x: SymbolType) -> Self {
+		use SymbolType::*;
+		match x {
+			Function => STT_FUNC,
+			Object => STT_OBJECT,
+			Section => STT_SECTION,
+			Other(x) => x,
+		}
+	}
+}
+
 #[derive(Debug, Copy, Clone)]
 pub enum SymbolValue {
 	Undefined,
