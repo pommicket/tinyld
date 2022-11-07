@@ -241,7 +241,7 @@ impl Symbols {
 		self.global.insert(name, id);
 		id
 	}
-	
+
 	fn get_info_from_id(&self, id: SymbolId) -> &SymbolInfo {
 		// Self::add_ is the only function that constructs SymbolIds.
 		// unless someone uses a SymbolId across Symbols instances (why would you do that),
@@ -291,12 +291,11 @@ pub struct Linker<'a> {
 	symbols: Symbols,
 	symbol_names: SymbolNames,
 	relocations: Vec<Relocation>,
-	sources: Vec<String>,                   // object files
+	sources: Vec<String>, // object files
 	libraries: Vec<String>,
-	bss_size: u64,                               // output bss size
-	bss_addr: u64,                               // output bss address
-	data_addr: u64,                              // output data address
-	symbol_data_offsets: HashMap<SymbolId, u64>, // for symbols with data, this holds the offsets into the data segment.
+	/// Output bss size.
+	/// As more objects are added, this grows.
+	bss_size: u64,
 	warn: Box<dyn Fn(LinkWarning) + 'a>,
 }
 
@@ -337,21 +336,27 @@ impl SymbolOffsetMap {
 // this is needed so we don't emit anything for unused symbols.
 type SymbolGraph = HashMap<SymbolId, Vec<SymbolId>>;
 
-struct Executable {
+struct LinkerOutput {
+	/// for symbols with data, this holds the offsets into the data segment.
+	symbol_data_offsets: HashMap<SymbolId, u64>,
 	interp: Vec<u8>,
 	load_addr: u64,
 	bss: Option<(u64, u64)>,
+	/// these bytes will make up the text+data section of our executable.
+	data: Vec<u8>,
 	relocations: Vec<(Relocation, u64)>,
 	strtab: Vec<u8>,
 	symbol_strtab_offsets: HashMap<SymbolName, u64>,
 	lib_strtab_offsets: Vec<u64>,
 }
 
-impl Executable {
+impl LinkerOutput {
 	pub fn new(load_addr: u64) -> Self {
 		Self {
+			symbol_data_offsets: HashMap::new(),
 			bss: None,
 			load_addr,
+			data: vec![],
 			interp: vec![],
 			relocations: vec![],
 			lib_strtab_offsets: vec![],
@@ -419,12 +424,16 @@ impl Executable {
 		self.load_addr + self.data_offset()
 	}
 
-	pub fn write(&self, data: &[u8], mut out: impl Write + Seek) -> LinkResult<()> {
+	pub fn bss_addr(&self) -> Option<u64> {
+		self.bss.map(|(a, _)| a)
+	}
+
+	pub fn write(&self, mut out: impl Write + Seek) -> LinkResult<()> {
 		let load_addr = self.load_addr as u32;
 
 		// start by writing data.
 		out.seek(io::SeekFrom::Start(self.data_offset()))?;
-		out.write_all(data)?;
+		out.write_all(&self.data)?;
 
 		let mut interp_offset = 0;
 		let mut dyntab_offset = 0;
@@ -603,13 +612,10 @@ impl<'a> Linker<'a> {
 		Linker {
 			symbols: Symbols::new(),
 			symbol_names: SymbolNames::new(),
-			bss_addr: 0,
 			bss_size: 0,
-			data_addr: 0,
 			relocations: vec![],
 			sources: vec![],
 			libraries: vec![],
-			symbol_data_offsets: HashMap::new(),
 			warn: Box::new(Self::default_warn_handler),
 		}
 	}
@@ -746,40 +752,44 @@ impl<'a> Linker<'a> {
 	}
 
 	/// Get value of symbol (e.g. ID of main → address of main).
-	fn get_symbol_value(&self, sym: SymbolId) -> u64 {
+	fn get_symbol_value(&self, exec: &LinkerOutput, sym: SymbolId) -> u64 {
 		let info = self.symbols.get_info_from_id(sym);
 		use SymbolValue::*;
 		match info.value {
 			Data(_) => {
-				self
+				exec
 				.symbol_data_offsets
 				.get(&sym)
 				.unwrap() // @TODO: can this panic?
-				+ self.data_addr
+				+ exec.data_addr()
 			}
-			Bss(x) => self.bss_addr + x,
+			Bss(x) => {
+				// this shouldn't panic, since we always generate a bss section
+				// @TODO: make bss optional
+				exec.bss_addr().expect("no bss") + x
+			}
 			Absolute(a) => a,
 		}
 	}
 
 	/// Get offset in data section where relocation should be applied.
-	fn get_rel_apply_data_offset(&self, rel: &Relocation) -> Option<u64> {
+	fn get_rel_apply_data_offset(&self, exec: &LinkerOutput, rel: &Relocation) -> Option<u64> {
 		let apply_symbol = rel.r#where.0;
-		let r = self.symbol_data_offsets.get(&apply_symbol)?;
+		let r = exec.symbol_data_offsets.get(&apply_symbol)?;
 		Some(*r + rel.r#where.1)
 	}
 
 	/// Apply relocation to data.
 	/// Returns `Ok(true)` if the relocation was dealt with, and
 	/// `Ok(false)` if the symbol is not defined (so it needs to be loaded from a dynamic library).
-	fn apply_relocation(&self, rel: &Relocation, data: &mut [u8]) -> LinkResult<bool> {
+	fn apply_relocation(&self, exec: &mut LinkerOutput, rel: &Relocation) -> LinkResult<bool> {
 		let apply_symbol = rel.r#where.0;
-		let apply_offset = match self.get_rel_apply_data_offset(&rel) {
+		let apply_offset = match self.get_rel_apply_data_offset(exec, &rel) {
 			Some(data_offset) => data_offset,
 			None => return Ok(true), // this relocation isn't in a data section so there's nothing we can do about it
 		};
-		let pc = apply_offset + self.data_addr;
-		
+		let pc = apply_offset + exec.data_addr();
+
 		let symbol = match self.get_symbol_id(rel.source_id, rel.sym) {
 			None => {
 				// symbol not defined. it should come from a library.
@@ -788,7 +798,7 @@ impl<'a> Linker<'a> {
 			Some(sym) => sym,
 		};
 
-		let symbol_value = self.get_symbol_value(symbol);
+		let symbol_value = self.get_symbol_value(exec, symbol);
 
 		let addend = rel.addend;
 
@@ -819,7 +829,7 @@ impl<'a> Linker<'a> {
 				let mut in_bounds = true;
 				match value {
 					U32(u) => {
-						if let Some(apply_to) = data.get_mut(apply_start..apply_start + 4) {
+						if let Some(apply_to) = exec.data.get_mut(apply_start..apply_start + 4) {
 							let curr_val = u32_from_le_slice(apply_to);
 							apply_to.copy_from_slice(&(u + curr_val).to_le_bytes());
 						} else {
@@ -889,26 +899,26 @@ impl<'a> Linker<'a> {
 	// we don't want to link unused symbols.
 	// we start by calling this on the entry function, then it recursively calls itself for each symbol used.
 	fn add_data_for_symbol(
-		&mut self,
-		data: &mut Vec<u8>,
+		&self,
+		exec: &mut LinkerOutput,
 		symbol_graph: &SymbolGraph,
 		id: SymbolId,
 	) -> Result<(), LinkError> {
 		// deal with cycles
-		if self.symbol_data_offsets.contains_key(&id) {
+		if exec.symbol_data_offsets.contains_key(&id) {
 			return Ok(());
 		}
 
 		let info = self.symbols.get_info_from_id(id);
 		if let SymbolValue::Data(d) = &info.value {
 			// set address
-			self.symbol_data_offsets.insert(id, data.len() as u64);
+			exec.symbol_data_offsets.insert(id, exec.data.len() as u64);
 			// add data
-			data.extend(d);
+			exec.data.extend(d);
 		}
 
 		for reference in symbol_graph.get(&id).unwrap_or(&vec![]) {
-			self.add_data_for_symbol(data, symbol_graph, *reference)?;
+			self.add_data_for_symbol(exec, symbol_graph, *reference)?;
 		}
 
 		Ok(())
@@ -917,7 +927,7 @@ impl<'a> Linker<'a> {
 	/// Link everything together.
 	/// Currently this drops `self` (you probably don't need to link multiple times).
 	/// That might change in a future version.
-	pub fn link(mut self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
+	pub fn link(&self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
 		let mut symbol_graph = SymbolGraph::with_capacity(self.symbols.count());
 
 		// compute symbol graph
@@ -938,15 +948,12 @@ impl<'a> Linker<'a> {
 
 		let symbol_graph = symbol_graph; // no more mutating
 
-		let mut exec = Executable::new(0x400000);
-		self.bss_addr = 0x50000000;
-		exec.set_bss(self.bss_addr, self.bss_size);
+		let mut exec = LinkerOutput::new(0x400000);
+		exec.set_bss(0x70000000, self.bss_size);
 		exec.set_interp("/lib/ld-linux.so.2");
 		for lib in self.libraries.iter() {
 			exec.add_lib(lib);
 		}
-
-		self.data_addr = exec.data_addr();
 
 		let entry_name_id = self
 			.symbol_names
@@ -957,23 +964,22 @@ impl<'a> Linker<'a> {
 			.get_id_from_name(SourceId::NONE, entry_name_id)
 			.ok_or_else(|| LinkError::EntryNotDefined(entry.into()))?;
 
-		let mut data = vec![];
-		self.add_data_for_symbol(&mut data, &symbol_graph, entry_id)?;
+		self.add_data_for_symbol(&mut exec, &symbol_graph, entry_id)?;
 
 		for rel in self.relocations.iter() {
-			if !self.apply_relocation(rel, &mut data)? {
+			if !self.apply_relocation(&mut exec, rel)? {
 				// dynamic library relocation
-				if let Some(data_offset) = self.get_rel_apply_data_offset(rel) {
-					exec.add_relocation(&self.symbol_names, rel, self.data_addr + data_offset);
+				if let Some(data_offset) = self.get_rel_apply_data_offset(&exec, rel) {
+					exec.add_relocation(&self.symbol_names, rel, exec.data_addr() + data_offset);
 				}
 			}
 		}
-		
-		exec.write(&data, out)
+
+		exec.write(out)
 	}
 
 	/// Easy linking API. Just provide a path.
-	pub fn link_to_file(self, path: impl AsRef<path::Path>, entry: &str) -> Result<(), String> {
+	pub fn link_to_file(&self, path: impl AsRef<path::Path>, entry: &str) -> Result<(), String> {
 		let path = path.as_ref();
 		let mut out_options = fs::OpenOptions::new();
 		out_options.write(true).create(true).truncate(true);
