@@ -427,6 +427,44 @@ impl LinkerOutput {
 	pub fn bss_addr(&self) -> Option<u64> {
 		self.bss.map(|(a, _)| a)
 	}
+	
+	/// has a data symbol been added with this ID?
+	pub fn is_data_symbol(&self, id: SymbolId) -> bool {
+		self.symbol_data_offsets.contains_key(&id)
+	}
+	
+	/// add some data to the executable, and associate it with the given symbol ID.
+	pub fn add_data_symbol(&mut self, id: SymbolId, data: &[u8]) {
+		// set address
+		self.symbol_data_offsets.insert(id, self.data.len() as u64);
+		// add data
+		self.data.extend(data);
+	}
+	
+	/// Get offset in data section where relocation should be applied.
+	pub fn get_rel_data_offset(&self, rel: &Relocation) -> Option<u64> {
+		let apply_symbol = rel.r#where.0;
+		let r = self.symbol_data_offsets.get(&apply_symbol)?;
+		Some(*r + rel.r#where.1)
+	}
+	
+	pub fn eval_symbol_value(&self, id: SymbolId, value: &SymbolValue) -> u64 {
+		use SymbolValue::*;
+		match value {
+			Data(_) => {
+				self.symbol_data_offsets
+					.get(&id)
+					.unwrap() // @TODO: can this panic?
+					+ self.data_addr()
+			}
+			Bss(x) => {
+				// this shouldn't panic, since we always generate a bss section
+				// @TODO: make bss optional
+				self.bss_addr().expect("no bss") + x
+			}
+			Absolute(a) => *a,
+		}
+	}
 
 	pub fn write(&self, mut out: impl Write + Seek) -> LinkResult<()> {
 		let load_addr = self.load_addr as u32;
@@ -754,29 +792,7 @@ impl<'a> Linker<'a> {
 	/// Get value of symbol (e.g. ID of main → address of main).
 	fn get_symbol_value(&self, exec: &LinkerOutput, sym: SymbolId) -> u64 {
 		let info = self.symbols.get_info_from_id(sym);
-		use SymbolValue::*;
-		match info.value {
-			Data(_) => {
-				exec
-				.symbol_data_offsets
-				.get(&sym)
-				.unwrap() // @TODO: can this panic?
-				+ exec.data_addr()
-			}
-			Bss(x) => {
-				// this shouldn't panic, since we always generate a bss section
-				// @TODO: make bss optional
-				exec.bss_addr().expect("no bss") + x
-			}
-			Absolute(a) => a,
-		}
-	}
-
-	/// Get offset in data section where relocation should be applied.
-	fn get_rel_apply_data_offset(&self, exec: &LinkerOutput, rel: &Relocation) -> Option<u64> {
-		let apply_symbol = rel.r#where.0;
-		let r = exec.symbol_data_offsets.get(&apply_symbol)?;
-		Some(*r + rel.r#where.1)
+		exec.eval_symbol_value(sym, &info.value)
 	}
 
 	/// Apply relocation to data.
@@ -784,7 +800,7 @@ impl<'a> Linker<'a> {
 	/// `Ok(false)` if the symbol is not defined (so it needs to be loaded from a dynamic library).
 	fn apply_relocation(&self, exec: &mut LinkerOutput, rel: &Relocation) -> LinkResult<bool> {
 		let apply_symbol = rel.r#where.0;
-		let apply_offset = match self.get_rel_apply_data_offset(exec, &rel) {
+		let apply_offset = match exec.get_rel_data_offset(&rel) {
 			Some(data_offset) => data_offset,
 			None => return Ok(true), // this relocation isn't in a data section so there's nothing we can do about it
 		};
@@ -905,16 +921,13 @@ impl<'a> Linker<'a> {
 		id: SymbolId,
 	) -> Result<(), LinkError> {
 		// deal with cycles
-		if exec.symbol_data_offsets.contains_key(&id) {
+		if exec.is_data_symbol(id) {
 			return Ok(());
 		}
 
 		let info = self.symbols.get_info_from_id(id);
 		if let SymbolValue::Data(d) = &info.value {
-			// set address
-			exec.symbol_data_offsets.insert(id, exec.data.len() as u64);
-			// add data
-			exec.data.extend(d);
+			exec.add_data_symbol(id, d);
 		}
 
 		for reference in symbol_graph.get(&id).unwrap_or(&vec![]) {
@@ -969,7 +982,7 @@ impl<'a> Linker<'a> {
 		for rel in self.relocations.iter() {
 			if !self.apply_relocation(&mut exec, rel)? {
 				// dynamic library relocation
-				if let Some(data_offset) = self.get_rel_apply_data_offset(&exec, rel) {
+				if let Some(data_offset) = exec.get_rel_data_offset(rel) {
 					exec.add_relocation(&self.symbol_names, rel, exec.data_addr() + data_offset);
 				}
 			}
