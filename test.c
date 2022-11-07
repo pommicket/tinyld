@@ -1,10 +1,10 @@
-#include <stdio.h>
-#include <stdlib.h>
+#include<stdio.h>
 
-int my_number;
-void entry() {
-	my_number = 137;
-	printf("%d\n",my_number);
-	exit(0);
-	    
+void entry(void) {
+	printf("hi\n");
+	__asm__ (
+		"mov $1, %eax\n"
+		"mov $0, %ebx\n"
+		"int $0x80\n"
+	);
 }

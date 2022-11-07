@@ -42,6 +42,8 @@ pub enum LinkError {
 	NoEntry(String),
 	/// entry point was declared, but not defined
 	EntryNotDefined(String),
+	/// entry point defined, but has no data (e.g. `int entry[36];`)
+	EntryNoData(String),
 }
 
 impl LinkError {
@@ -67,6 +69,7 @@ impl fmt::Display for LinkError {
 			TooLarge => write!(f, "executable file would be too large."),
 			NoEntry(name) => write!(f, "entry point '{name}' not found."),
 			EntryNotDefined(name) => write!(f, "entry point '{name}' declared, but not defined."),
+			EntryNoData(name) => write!(f, "entry point '{name}' has no data."),
 		}
 	}
 }
@@ -220,9 +223,8 @@ struct SymbolId(SymbolIdType);
 enum SymbolValue {
 	/// offset into BSS section
 	Bss(u64),
-	/// Data associated with this symbol (machine code for functions,
-	/// bytes making up string literals, etc.)
-	Data(Vec<u8>),
+	/// this symbol has data in `source` at `offset..offset+size`
+	Data { source: SourceId, offset: u64, size: u64 },
 	/// An absolute value. This corresponds to relocations with
 	/// `shndx == SHN_ABS`.
 	Absolute(u64),
@@ -305,24 +307,13 @@ impl Symbols {
 			.or_else(|| self.weak.get(&name))
 			.copied()
 	}
-
-	fn get_location_from_id(&self, id: SymbolId) -> (SourceId, SymbolName) {
-		*self.locations.get(id.0 as usize).expect("bad symbol ID")
-	}
-
-	/// Number of defined symbols.
-	fn count(&self) -> usize {
-		self.info.len()
-	}
 }
 
 /// An ELF relocation.
 #[derive(Debug, Clone)]
 struct Relocation {
-	/// (symbol containing relocation, offset in symbol where relocation needs to be applied)
-	r#where: (SymbolId, u64),
-	/// which source is asking for this relocation
-	source_id: SourceId,
+	/// (source containing relocation, offset in source where it should be applied)
+	r#where: (SourceId, u64),
 	/// symbol that needs to be supplied
 	sym: SymbolName,
 	r#type: elf::RelType,
@@ -342,11 +333,16 @@ pub struct Linker<'a> {
 	cxx: String,
 	/// C++ compiler flags
 	cxxflags: Vec<String>,
-	relocations: Vec<Relocation>,
+	/// `relocations[n][addr]` = relocation in source `n` at offset `addr`.
+	relocations: Vec<BTreeMap<u64, Relocation>>,
 	/// `sources[n]` = name of source corresponding to [SourceId]`(n)`.
 	/// These aren't necessarily valid paths. They're just names
 	/// we can use in error messages.
 	sources: Vec<String>,
+	/// all source data. yes we keep it all in memory.
+	/// this is kind of needed since relocations can be little bitches and
+	/// demand a negative addend on a symbol (get stuff in data section *before* symbol).
+	source_data: Vec<Vec<u8>>,
 	/// dynamic libraries which have been added.
 	libraries: Vec<String>,
 	/// Output bss size.
@@ -356,71 +352,139 @@ pub struct Linker<'a> {
 	warn: Box<dyn Fn(LinkWarning) + 'a>,
 }
 
-/// Maps between offsets in an object file and symbols defined in that file.
-///
-/// (Note: this is specific to a single object file, and only kept around temporarily
-/// during a call to [Linker::add_object].)
-/// This is used to figure out where relocations are taking place.
-struct SymbolOffsetMap {
-	map: BTreeMap<(u64, u64), SymbolId>,
+#[derive(Clone)]
+struct SourceRanges {
+	/// keys are (offset, size).
+	/// INVARIANT: ranges are disjoint, and
+	/// non-adjacent (e.g. [5,10) + [10, 12) should be combined to [5, 12))
+	map: BTreeMap<(u64, u64), u64>,
 }
 
-impl SymbolOffsetMap {
+impl SourceRanges {
 	fn new() -> Self {
-		SymbolOffsetMap {
-			map: BTreeMap::new(),
-		}
+		Self { map: BTreeMap::new() }
 	}
-
-	fn add_symbol(&mut self, offset: u64, size: u64, id: SymbolId) {
-		if size > 0 {
-			self.map.insert((offset, offset + size), id);
+	
+	fn add(&mut self, start: u64, size: u64) -> bool {
+		let mut l = start;
+		let mut r = start + size;
+		
+		if let Some((&l_range, _)) = self.map.range(..=(l, u64::MAX)).last() {
+			if l_range.0 + l_range.1 >= r {
+				// [l, r) contained entirely inside l_range
+				return false;
+			}
+			if l_range.0 + l_range.1 >= l {
+				// extend left
+				l = l_range.0;
+				self.map.remove(&l_range);
+			}
 		}
+		
+		if let Some((&r_range, _)) = self.map.range((r, 0)..).next() {
+			if r_range.0 <= r {
+				// extend right
+				r = r_range.0 + r_range.1;
+				self.map.remove(&r_range);
+			}
+		}
+		
+		// delete subranges of [l,r)
+		// (only subranges will overlap [l,r] now)
+		// unfortunately there's no BTreeMap::drain yet.
+		let mut keys = vec![];
+		for (k, _) in self.map.range((l, 0)..=(r, u64::MAX)) {
+			assert!(k.0 >= l && k.1 <= r);
+			keys.push(*k);
+		}
+		for key in keys {
+			self.map.remove(&key);
+		}
+		
+		// insert [l,r)
+		self.map.insert((l, r - l), 0);
+		true
 	}
-
-	/// returns (symbol, offset in symbol).
-	/// e.g. a relocation might happen at `main+0x33`.
-	fn get(&self, offset: u64) -> Option<(SymbolId, u64)> {
-		let mut r = self.map.range(..(offset, u64::MAX));
-		let (key, value) = r.next_back()?;
-		if offset >= key.0 && offset < key.1 {
-			// offset corresponds to somewhere in this symbol
-			Some((*value, offset - key.0))
+	
+	fn get_value(&self, offset: u64) -> Option<u64> {
+		let (range, &value) = self.map.range(..=(offset, u64::MAX)).last()?;
+		if offset >= range.0 && offset < range.0 + range.1 {
+			Some(value)
 		} else {
 			None
 		}
 	}
-}
-
-/// Graph of which symbols depend on which symbols.
-///
-/// This is needed so we don't emit anything for unused symbols.
-struct SymbolGraph {
-	graph: Vec<Vec<SymbolId>>,
-}
-
-impl SymbolGraph {
-	fn new(symbol_count: usize) -> Self {
-		Self {
-			graph: vec![vec![]; symbol_count],
+	
+	fn set_values(&mut self, size: &mut u64) {
+		for (range, value) in self.map.iter_mut() {
+			// we should only call this function once
+			assert_eq!(*value, 0);
+			
+			*value = *size;
+			*size += range.1;
 		}
 	}
+}
 
-	fn add_dependency(&mut self, sym: SymbolId, depends_on: SymbolId) {
-		self.graph
-			.get_mut(sym.0 as usize)
-			.expect("bad symbol ID")
-			.push(depends_on);
+// @TODO: doc
+struct RangeSet {
+	/// `ranges[i]` = ranges for source #`i`.
+	ranges: Vec<SourceRanges>,
+}
+
+impl RangeSet {
+	fn new(source_count: usize) -> Self {
+		Self { ranges: vec![SourceRanges::new(); source_count] }
 	}
+	
+	/// Returns true if the range is not redundant with the current ranges.
+	fn add(&mut self, source: SourceId, start: u64, size: u64) -> bool {
+		self.ranges[source.0 as usize].add(start, size)
+	}
+	
+	fn to_map(mut self) -> OffsetMap {
+		let mut size = 0u64;
+		for range in self.ranges.iter_mut() {
+			range.set_values(&mut size)
+		}
+		OffsetMap {
+			size,
+			ranges: mem::take(&mut self.ranges)
+		}
+	}
+}
 
-	fn get_dependencies(&self, sym: SymbolId) -> &[SymbolId] {
-		self.graph.get(sym.0 as usize).expect("bad symbol ID")
+// @TODO: doc
+struct OffsetMap {
+	size: u64,
+	ranges: Vec<SourceRanges>,
+}
+
+impl OffsetMap {
+	fn get(&self, src: SourceId, offset: u64) -> Option<u64> {
+		self.ranges[src.0 as usize].get_value(offset)
+	}
+	
+	/// get offset in data section where relocation should be applied
+	fn get_rel_data_offset(&self, rel: &Relocation) -> Option<u64> {
+		self.get(rel.r#where.0, rel.r#where.1)
+	}
+	
+	fn size(&self) -> u64 {
+		self.size
+	}
+	
+	fn for_each(&self, mut f: impl FnMut(SourceId, u64, u64, u64)) {
+		for (src, ranges) in self.ranges.iter().enumerate() {
+			let src_id = SourceId(src.try_into().unwrap());
+			for (&(offset, size), &dest_offset) in ranges.map.iter() {
+				f(src_id, offset, size, dest_offset);
+			}
+		}
 	}
 }
 
 struct LinkerOutput {
-	/// for symbols with data, this holds the offsets into the data segment.
-	symbol_data_offsets: HashMap<SymbolId, u64>,
 	interp: Vec<u8>,
 	/// virtual address of big ol' section containing data + elf header + etc.
 	load_addr: u64,
@@ -445,7 +509,6 @@ struct LinkerOutput {
 impl LinkerOutput {
 	pub fn new(load_addr: u64) -> Self {
 		Self {
-			symbol_data_offsets: HashMap::new(),
 			bss: None,
 			load_addr,
 			data: vec![],
@@ -530,36 +593,22 @@ impl LinkerOutput {
 	pub fn bss_addr(&self) -> Option<u64> {
 		self.bss.map(|(a, _)| a)
 	}
-
-	/// has a data symbol been added with this ID?
-	pub fn is_data_symbol(&self, id: SymbolId) -> bool {
-		self.symbol_data_offsets.contains_key(&id)
+	
+	/// set data section
+	pub fn set_data(&mut self, data: Vec<u8>) {
+		self.data = data;
 	}
 
-	/// add some data to the executable, and associate it with the given symbol ID.
-	pub fn add_data_symbol(&mut self, id: SymbolId, data: &[u8]) {
-		// set address
-		self.symbol_data_offsets.insert(id, self.data.len() as u64);
-		// add data
-		self.data.extend(data);
-	}
-
-	/// get offset in data section where relocation should be applied
-	pub fn get_rel_data_offset(&self, rel: &Relocation) -> Option<u64> {
-		let apply_symbol = rel.r#where.0;
-		let r = self.symbol_data_offsets.get(&apply_symbol)?;
-		Some(*r + rel.r#where.1)
-	}
 
 	/// get the actual value of a [SymbolValue]
-	pub fn eval_symbol_value(&self, id: SymbolId, value: &SymbolValue) -> u64 {
+	pub fn eval_symbol_value(&self, map: &OffsetMap, value: &SymbolValue) -> u64 {
 		use SymbolValue::*;
 		match value {
-			Data(_) => {
+			Data { source, offset, .. } => {
 				// in theory, this should never panic
-				self.symbol_data_offsets
-					.get(&id)
-					.expect("bad symbol ID")
+				map
+					.get(*source, *offset)
+					.unwrap()
 					+ self.data_addr()
 			}
 			Bss(x) => {
@@ -762,13 +811,14 @@ impl<'a> Linker<'a> {
 			symbols: Symbols::new(),
 			symbol_names: SymbolNames::new(),
 			bss_size: 0,
-			cc: "cc".into(),
-			cxx: "c++".into(),
+			cc: "gcc".into(),
+			cxx: "g++".into(),
 			cflags: Self::DEFAULT_CFLAGS.iter().map(|&r| r.into()).collect(),
 			cxxflags: Self::DEFAULT_CXXFLAGS.iter().map(|&r| r.into()).collect(),
 			relocations: vec![],
 			sources: vec![],
 			libraries: vec![],
+			source_data: vec![],
 			warn: Box::new(Self::default_warning_handler),
 		}
 	}
@@ -799,33 +849,25 @@ impl<'a> Linker<'a> {
 		self.cxxflags = cxxflags.to_vec();
 	}
 
-	/// Get name of source file.
-	fn source_name(&self, id: SourceId) -> &str {
-		&self.sources[id.0 as usize]
-	}
-
 	/// add a symbol from a source file.
 	fn add_symbol(
 		&mut self,
 		source: SourceId,
 		elf: &elf::Reader32LE,
-		offset_map: &mut SymbolOffsetMap,
 		symbol: &elf::Symbol,
 	) -> Result<(), ObjectError> {
-		let mut data_offset = None;
 		let name = elf.symbol_name(symbol)?;
 		let name_id = self.symbol_names.add(name);
-
+		let size = symbol.size;
+		
 		let value = match symbol.value {
 			elf::SymbolValue::Undefined => None,
 			elf::SymbolValue::Absolute(n) => Some(SymbolValue::Absolute(n)),
 			elf::SymbolValue::SectionOffset(shndx, offset) => {
 				match elf.section_type(shndx) {
 					Some(elf::SectionType::ProgBits) => {
-						let mut data = vec![0; symbol.size as usize];
-						data_offset = Some(elf.section_offset(shndx).unwrap() + offset);
-						elf.read_section_data_exact(shndx, offset, &mut data)?;
-						Some(SymbolValue::Data(data))
+						let offset = elf.section_offset(shndx).unwrap() + offset;
+						Some(SymbolValue::Data { source, offset, size })
 					}
 					Some(elf::SectionType::NoBits) => {
 						let p = self.bss_size;
@@ -839,16 +881,12 @@ impl<'a> Linker<'a> {
 
 		if let Some(value) = value {
 			let info = SymbolInfo { value };
-			let symbol_id = match symbol.bind {
+			match symbol.bind {
 				elf::SymbolBind::Local => self.symbols.add_local(source, name_id, info),
 				elf::SymbolBind::Global => self.symbols.add_global(source, name_id, info),
 				elf::SymbolBind::Weak => self.symbols.add_weak(source, name_id, info),
 				_ => return Ok(()), // eh
 			};
-
-			if let Some(offset) = data_offset {
-				offset_map.add_symbol(offset, symbol.size, symbol_id);
-			}
 		}
 		Ok(())
 	}
@@ -862,11 +900,8 @@ impl<'a> Linker<'a> {
 		reader: impl BufRead + Seek,
 	) -> Result<(), ObjectError> {
 		use ObjectError::*;
-
-		let mut offset_map = SymbolOffsetMap::new();
-
+		
 		let source_id = SourceId(self.sources.len() as _);
-		self.sources.push(name.into());
 
 		let elf = elf::Reader32LE::new(reader)?;
 		if elf.r#type() != elf::Type::Rel {
@@ -874,27 +909,24 @@ impl<'a> Linker<'a> {
 		}
 
 		for symbol in elf.symbols() {
-			self.add_symbol(source_id, &elf, &mut offset_map, symbol)?;
+			self.add_symbol(source_id, &elf, symbol)?;
 		}
 
+		let mut relocations = BTreeMap::new();
 		for rel in elf.relocations() {
-			if let Some(r#where) = offset_map.get(rel.offset) {
-				let sym = self.symbol_names.add(elf.symbol_name(&rel.symbol)?);
-				self.relocations.push(Relocation {
-					r#where,
-					source_id,
-					sym,
-					symbol_type: rel.symbol.r#type,
-					r#type: rel.r#type,
-					addend: rel.addend,
-				});
-			} else {
-				self.emit_warning(LinkWarning::RelNoSym(
-					self.source_name(source_id).into(),
-					rel.entry_offset,
-				));
-			}
+			let sym = self.symbol_names.add(elf.symbol_name(&rel.symbol)?);
+			relocations.insert(rel.offset, Relocation {
+				r#where: (source_id, rel.offset),
+				sym,
+				symbol_type: rel.symbol.r#type,
+				r#type: rel.r#type,
+				addend: rel.addend,
+			});
 		}
+		
+		self.relocations.push(relocations);
+		self.sources.push(name.into());
+		self.source_data.push(elf.to_data());
 
 		Ok(())
 	}
@@ -998,11 +1030,6 @@ impl<'a> Linker<'a> {
 		}
 	}
 
-	/// Get name of symbol.
-	fn symbol_name_str(&self, id: SymbolName) -> &str {
-		self.symbol_names.get_str(id).unwrap_or("???")
-	}
-
 	/// Do a warning.
 	fn emit_warning(&self, warning: LinkWarning) {
 		(self.warn)(warning);
@@ -1013,27 +1040,16 @@ impl<'a> Linker<'a> {
 	fn get_symbol_id(&self, source_id: SourceId, name: SymbolName) -> Option<SymbolId> {
 		self.symbols.get_id_from_name(source_id, name)
 	}
-
-	/// Generates a string like "main.c:some_function".
-	fn symbol_id_location_string(&self, id: SymbolId) -> String {
-		let (source, name) = self.symbols.get_location_from_id(id);
-		format!(
-			"{}:{}",
-			self.source_name(source),
-			self.symbol_name_str(name)
-		)
-	}
-
+	
 	/// Get value of symbol (e.g. ID of main → address of main).
-	fn get_symbol_value(&self, exec: &LinkerOutput, sym: SymbolId) -> u64 {
+	fn get_symbol_value(&self, map: &OffsetMap, exec: &LinkerOutput, sym: SymbolId) -> u64 {
 		let info = self.symbols.get_info_from_id(sym);
-		exec.eval_symbol_value(sym, &info.value)
+		exec.eval_symbol_value(map, &info.value)
 	}
 
 	/// Apply relocation to executable.
-	fn apply_relocation(&self, exec: &mut LinkerOutput, rel: &Relocation) -> LinkResult<()> {
-		let apply_symbol = rel.r#where.0;
-		let apply_offset = match exec.get_rel_data_offset(rel) {
+	fn apply_relocation(&self, exec: &mut LinkerOutput, map: &OffsetMap, rel: &Relocation) -> LinkResult<()> {
+		let apply_offset = match map.get_rel_data_offset(rel) {
 			Some(data_offset) => data_offset,
 			None => {
 				// this relocation isn't in a data section so there's nothing we can do about it
@@ -1042,7 +1058,7 @@ impl<'a> Linker<'a> {
 		};
 		let pc = apply_offset + exec.data_addr();
 
-		let symbol = match self.get_symbol_id(rel.source_id, rel.sym) {
+		let symbol = match self.get_symbol_id(rel.r#where.0, rel.sym) {
 			None => {
 				// symbol not defined. it should come from a library.
 				exec.add_relocation(&self.symbol_names, rel, exec.data_addr() + apply_offset);
@@ -1051,7 +1067,7 @@ impl<'a> Linker<'a> {
 			Some(sym) => sym,
 		};
 
-		let symbol_value = self.get_symbol_value(exec, symbol);
+		let symbol_value = self.get_symbol_value(map, exec, symbol);
 
 		let addend = rel.addend;
 
@@ -1072,10 +1088,6 @@ impl<'a> Linker<'a> {
 			}
 		};
 
-		let apply_symbol_info = self.symbols.get_info_from_id(apply_symbol);
-
-		use SymbolValue::*;
-
 		// guarantee failure if apply_offset can't be converted to usize.
 		// (this will probably never happen)
 		let apply_start = apply_offset.try_into().unwrap_or(usize::MAX - 1000);
@@ -1085,81 +1097,35 @@ impl<'a> Linker<'a> {
 		}
 		
 
-		match apply_symbol_info.value {
-			Data(_) => {
-				let mut in_bounds = true;
-				match value {
-					U32(u) => {
-						if let Some(apply_to) = exec.data.get_mut(apply_start..apply_start + 4) {
-							let curr_val = u32_from_le_slice(apply_to);
-							let new_val = u.wrapping_add(curr_val);
-							apply_to.copy_from_slice(&new_val.to_le_bytes());
-						} else {
-							in_bounds = false;
-						}
-					}
-				};
-
-				if !in_bounds {
-					self.emit_warning(LinkWarning::RelOOB(
-						self.symbol_id_location_string(apply_symbol),
-						apply_offset,
-					));
+		match value {
+			U32(u) => {
+				if let Some(apply_to) = exec.data.get_mut(apply_start..apply_start + 4) {
+					let curr_val = u32_from_le_slice(apply_to);
+					let new_val = u.wrapping_add(curr_val);
+					apply_to.copy_from_slice(&new_val.to_le_bytes());
 				}
 			}
-			_ => {
-				self.emit_warning(LinkWarning::RelNoSym(
-					self.source_name(rel.source_id).into(),
-					apply_offset,
-				));
+		};
+
+		Ok(())
+	}
+
+
+	fn require_range(&self, ranges: &mut RangeSet, source: SourceId, offset: u64, size: u64) {
+		if ranges.add(source, offset, size) {
+			for (_, rel) in self.relocations[source.0 as usize].range(offset..offset + size) {
+				if let Some(symbol) = self.get_symbol_id(rel.r#where.0, rel.sym) {
+					let value = &self.symbols.get_info_from_id(symbol).value;
+					if let SymbolValue::Data { source: req_source, offset: req_offset, size: req_size } = value {
+						self.require_range(ranges, *req_source, *req_offset, *req_size)
+					} // else, it's okay, it's a bss relocation or something hopefully
+				} // else, we'll deal with it in apply_relocation
 			}
 		}
-
-		Ok(())
 	}
-
-
-	/// Add data for a symbol.
-	/// We don't want to link unused symbols.
-	/// We start by calling this on the entry function,
-	/// then it recursively calls itself for each symbol used.
-	fn add_data_for_symbol(
-		&self,
-		exec: &mut LinkerOutput,
-		symbol_graph: &SymbolGraph,
-		id: SymbolId,
-	) -> Result<(), LinkError> {
-		// deal with cycles
-		if exec.is_data_symbol(id) {
-			return Ok(());
-		}
-
-		let info = self.symbols.get_info_from_id(id);
-		if let SymbolValue::Data(d) = &info.value {
-			exec.add_data_symbol(id, d);
-		}
-
-		for reference in symbol_graph.get_dependencies(id) {
-			self.add_data_for_symbol(exec, symbol_graph, *reference)?;
-		}
-
-		Ok(())
-	}
-
+	
 	/// Link everything together.
 	pub fn link(&self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
-		let mut symbol_graph = SymbolGraph::new(self.symbols.count());
-
-		// compute symbol graph
-		for rel in self.relocations.iter() {
-			if let Some(symbol) = self.get_symbol_id(rel.source_id, rel.sym) {
-				let apply_symbol = rel.r#where.0;
-				symbol_graph.add_dependency(apply_symbol, symbol);
-			}
-		}
-
-		let symbol_graph = symbol_graph; // no more mutating
-
 		let mut exec = LinkerOutput::new(0x400000);
 		if self.bss_size > 0 {
 			exec.set_bss(0x70000000, self.bss_size);
@@ -1179,11 +1145,37 @@ impl<'a> Linker<'a> {
 			.symbols
 			.get_id_from_name(SourceId::NONE, entry_name_id)
 			.ok_or_else(|| LinkError::EntryNotDefined(entry.into()))?;
-
-		self.add_data_for_symbol(&mut exec, &symbol_graph, entry_id)?;
-
-		for rel in self.relocations.iter() {
-			self.apply_relocation(&mut exec, rel)?;
+		
+		let mut ranges = RangeSet::new(self.sources.len());
+		
+		let entry_value = &self.symbols.get_info_from_id(entry_id).value;
+		if let SymbolValue::Data { source, offset, size } = entry_value {
+			self.require_range(&mut ranges, *source, *offset, *size);
+		} else {
+			return Err(LinkError::EntryNoData(entry.into()));
+		}
+		
+		// compute offset map
+		let offset_map = ranges.to_map();
+		
+		let mut data_section = vec![0; offset_map.size() as usize];
+		
+		offset_map.for_each(|source: SourceId, src_offset: u64, size: u64, dest_offset: u64| {
+			let dest_start = dest_offset as usize;
+			let dest_end = dest_start + size as usize;
+			let src_start = src_offset as usize;
+			let src_end = src_start + size as usize;
+			data_section[dest_start..dest_end].copy_from_slice(
+				&self.source_data[source.0 as usize][src_start..src_end]
+			);
+		});
+		
+		exec.set_data(data_section);
+		
+		for rel_map in self.relocations.iter() {
+			for rel in rel_map.values() {
+				self.apply_relocation(&mut exec, &offset_map, rel)?;
+			}
 		}
 
 		exec.write(out)

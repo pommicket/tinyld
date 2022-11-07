@@ -214,6 +214,7 @@ pub enum Error {
 	NotAnElf,
 	BadUtf8,
 	BadVersion,
+	TooLarge,
 	UnsupportedClass(u8, u8),
 	BadShStrNdx(u16),
 	BadSymShNdx(u16),
@@ -236,6 +237,7 @@ impl fmt::Display for Error {
 			IO(i) if i.kind() == io::ErrorKind::UnexpectedEof => write!(f, "unexpected EOF"),
 			IO(i) => write!(f, "IO error: {i}"),
 			NotAnElf => write!(f, "Not an ELF file."),
+			TooLarge => write!(f, "ELF file too large."),
 			UnsupportedClass(class, data) => {
 				let class_str = match class {
 					1 => "32",
@@ -456,8 +458,8 @@ where
 	fn symbol_name(&self, sym: &Symbol) -> Result<String>;
 	/// type of section with index `idx`
 	fn section_type(&self, idx: u16) -> Option<SectionType>;
-	/// read data from the section with index `idx` at offset `offset`.
-	fn read_section_data_exact(&self, idx: u16, offset: u64, data: &mut [u8]) -> Result<()>;
+	/// get file data. this drops the reader.
+	fn to_data(self) -> Vec<u8>;
 }
 
 /// reader for 32-bit little-endian ELF files.
@@ -467,10 +469,10 @@ pub struct Reader32LE {
 	symbols: Vec<Symbol>,
 	/// index of .strtab section
 	strtab_idx: Option<u16>,
-	/// All data of all sections.
+	/// All data in the file.
 	/// We put it all in memory.
 	/// Object files usually aren't huge or anything.
-	section_data: Vec<Vec<u8>>,
+	data: Vec<u8>,
 	relocations: Vec<Relocation>,
 }
 
@@ -488,6 +490,13 @@ impl Reader32LE {
 impl Reader for Reader32LE {
 	fn new(mut reader: impl BufRead + Seek) -> Result<Self> {
 		use Error::*;
+		
+		reader.seek(io::SeekFrom::End(0))?;
+		let file_size = reader.stream_position()?;
+		reader.seek(io::SeekFrom::Start(0))?;		
+		let mut data = vec![0; file_size.try_into().map_err(|_| TooLarge)?];
+		reader.read_exact(&mut data)?;
+		reader.seek(io::SeekFrom::Start(0))?;	
 
 		let mut hdr_buf = [0; 0x34];
 		reader.read_exact(&mut hdr_buf)?;
@@ -517,15 +526,9 @@ impl Reader for Reader32LE {
 		let mut symtabs = Vec::with_capacity(ehdr.shnum.into());
 		// all the symbols
 		let mut symbols = vec![];
-		let mut section_data = Vec::with_capacity(ehdr.shnum.into());
 		let mut strtab_idx = None;
 
 		for (s_idx, shdr) in shdrs.iter().enumerate() {
-			let mut data = vec![0; shdr.size as usize];
-			reader.seek(io::SeekFrom::Start(shdr.offset.into()))?;
-			reader.read_exact(&mut data)?;
-			section_data.push(data);
-
 			if let Some(shstrhdr) = shdrs.get(ehdr.shstrndx as usize) {
 				// get name
 				reader.seek(io::SeekFrom::Start(
@@ -651,7 +654,7 @@ impl Reader for Reader32LE {
 			symbols,
 			strtab_idx,
 			relocations,
-			section_data,
+			data,
 		})
 	}
 
@@ -676,7 +679,9 @@ impl Reader for Reader32LE {
 	}
 
 	fn symbol_name(&self, sym: &Symbol) -> Result<String> {
-		let strtab = &self.section_data[self.strtab_idx.ok_or(Error::NoStrtab)? as usize];
+		let strtab_offset = self.shdrs[usize::from(self.strtab_idx.ok_or(Error::NoStrtab)?)].offset;
+		let strtab = &self.data.get(strtab_offset as usize..)
+			.ok_or(Error::NoStrtab)?;
 		let i = sym.name as usize;
 		let mut end = i;
 		while end < strtab.len() && strtab[end] != b'\0' {
@@ -689,19 +694,7 @@ impl Reader for Reader32LE {
 		self.shdrs.get(idx as usize).map(|shdr| shdr.r#type.into())
 	}
 
-	fn read_section_data_exact(&self, idx: u16, offset: u64, data: &mut [u8]) -> Result<()> {
-		let section = self
-			.section_data
-			.get(usize::from(idx))
-			.ok_or(Error::BadSectionIndex(idx))?;
-		if offset + data.len() as u64 > section.len() as u64 {
-			return Err(Error::IO(io::Error::from(io::ErrorKind::UnexpectedEof)));
-		}
-
-		let offset = offset as usize;
-
-		data.copy_from_slice(&section[offset..offset + data.len()]);
-
-		Ok(())
+	fn to_data(self) -> Vec<u8> {
+		self.data
 	}
 }

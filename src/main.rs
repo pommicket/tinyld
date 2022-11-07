@@ -1,7 +1,9 @@
 /*
 @TODO:
-- compile as well as link
-- disable "warning: relocation XXX not in a data/text section" for .rel.eh_frame
+- get rid of RelNoSym + RelOOB
+- ObjectResult
+- what happens when a symbol has two definitions? can this happen with multiple c++ files which use the same template?
+- disable "warning: relocation XXX not in a data/text section" for .rel.eh_frame + maybe others
     - these warnings are being generated in two places. do they need to be?
 - make executables more tiny (overlap sections, etc.)
 - generate a warning/error on position-independent object files
@@ -10,7 +12,6 @@
 
 extern crate clap;
 
-use std::env;
 use clap::Parser;
 
 #[cfg(target_endian = "big")]
@@ -44,27 +45,21 @@ struct Args {
 	nya: bool,
 	/// C compiler
 	///
-	/// First this is checked, then the `CC` environment variable,
-	/// then if both aren't set, (/usr/bin/)cc is used.
-	#[arg(long = "cc", default_value = "auto")]
+	/// Note: clang *really* wants to generate `R_386_PLT32` relocations
+	///  even when you beg it not to.
+	#[arg(long = "cc", default_value = "gcc")]
 	cc: String,
 	/// C compiler flags
 	///
 	/// The C compiler is invoked using `(cc) (cflags) (C file) -o (object file)`
 	#[arg(long = "cflags", default_values = linker::Linker::DEFAULT_CFLAGS)]
 	cflags: Vec<String>,
-}
-
-impl Args {
-	fn get_c_compiler(&self) -> String {
-		if self.cc != "auto" {
-			self.cc.clone()
-		} else if let Ok(env_cc) = env::var("CC") {
-			env_cc
-		} else {
-			"cc".into()
-		}
-	}
+	/// C++ compiler
+	#[arg(long = "cxx", default_value = "g++")]
+	cxx: String,
+	/// C++ compiler flags
+	#[arg(long = "cxxflags", default_values = linker::Linker::DEFAULT_CXXFLAGS)]
+	cxxflags: Vec<String>,
 }
 
 fn main_() -> Result<(), String> {
@@ -79,7 +74,10 @@ fn main_() -> Result<(), String> {
 
 	let mut linker = linker::Linker::new();
 	
-	linker.set_cc(&args.get_c_compiler());
+	linker.set_cc(&args.cc);
+	linker.set_cflags(&args.cflags);
+	linker.set_cxx(&args.cxx);
+	linker.set_cxxflags(&args.cxxflags);
 
 	let warning_handler = |w| {
 		// termcolor is a goddamn nightmare to use
@@ -92,7 +90,7 @@ fn main_() -> Result<(), String> {
 	if inputs.is_empty() {
 		if cfg!(debug_assertions) {
 			// ease of use when debugging
-			linker.add_input("test.o")?;
+			linker.add_input("test.c")?;
 		} else {
 			return Err("no inputs provided.".into());
 		}
