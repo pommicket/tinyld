@@ -1,8 +1,9 @@
 /*!
 Linker producing small executables.
 Smallness is the *only* goal.
-This linker makes "bad" executables in many ways.
-You shouldn't use it unless all you want is a tiny little executable file.
+This linker makes "bad" executables in many ways. For example,
+all initialized data will be executable. All code will be writable.
+You shouldn't use this unless all you want is a tiny little executable file.
 
 Currently, only 32-bit ELF is supported.
 If you are using C, you will need `gcc-multilib` for the 32-bit headers.
@@ -23,14 +24,13 @@ As such, the resulting executable will be difficult to debug and *C++ exceptions
 may not work*. 
 */
 
-use crate::{elf, util};
+use crate::elf;
 use io::{BufRead, Seek, Write};
 use std::collections::{BTreeMap, HashMap};
 use std::{fmt, fs, io, mem, path};
 
 use elf::Reader as ELFReader;
 use elf::ToBytes;
-use util::u32_from_le_slice;
 
 pub enum LinkError {
 	IO(io::Error),
@@ -38,7 +38,7 @@ pub enum LinkError {
 	TooLarge,
 	/// entry point not found
 	NoEntry(String),
-	/// entry point was declared, and (probably) used, but not defined
+	/// entry point was declared, but not defined
 	EntryNotDefined(String),
 }
 
@@ -71,10 +71,10 @@ impl From<&LinkError> for String {
 pub enum LinkWarning {
 	/// unsupported relocation type
 	RelUnsupported(u8),
-	/// relocation is too large to fit inside its owner
+	/// relocation is too large to fit inside its symbol
 	RelOOB(String, u64),
-	/// relocation is in a BSS section or some shit
-	RelNoData(String, u64),
+	/// relocation does not take place in a symbol's data
+	RelNoSym(String, u64),
 }
 
 impl fmt::Display for LinkWarning {
@@ -82,7 +82,7 @@ impl fmt::Display for LinkWarning {
 		use LinkWarning::*;
 		match self {
 			RelOOB(text, offset) => write!(f, "relocation applied to {text}+0x{offset:x}, which goes outside of the symbol (it will be ignored)."),
-			RelNoData(source, offset) => write!(
+			RelNoSym(source, offset) => write!(
 				f,
 				"relocation {source}+0x{offset:x} not in a data/text section. it will be ignored."
 			),
@@ -131,7 +131,8 @@ impl fmt::Display for ObjectError {
 
 type SymbolNameType = u32;
 /// To be more efficient™, we use integers to keep track of symbol names.
-/// A SymbolName doesn't need to refer to a symbol which has been defined.
+///
+/// A `SymbolName` doesn't need to refer to a symbol which has been defined.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 struct SymbolName(SymbolNameType);
 /// Keeps track of string-[SymbolName] conversion.
@@ -182,14 +183,18 @@ impl SourceId {
 }
 
 type SymbolIdType = u32;
-//// A symbol ID refers to a symbol *which has a definition*, unlike [SymbolName].
+
+/// A symbol ID refers to a specific *definition* of a symbol.
+///
+/// There might be multiple `SymbolId`s corresponding to a single [SymbolName],
+/// since local symbols with the same name can be defined in separate object files.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 struct SymbolId(SymbolIdType);
 
 /// Value of a symbol.
 #[derive(Debug)]
 enum SymbolValue {
-	/// We make one big BSS section, this is an offset into it.
+	/// offset into BSS section
 	Bss(u64),
 	/// Data associated with this symbol (machine code for functions,
 	/// bytes making up string literals, etc.)
@@ -317,8 +322,9 @@ pub struct Linker<'a> {
 	warn: Box<dyn Fn(LinkWarning) + 'a>,
 }
 
-/// maps between offsets in an object file and symbols defined in that file.
-/// (Note: it is specific to a single object file, and only kept around temporarily
+/// Maps between offsets in an object file and symbols defined in that file.
+///
+/// (Note: this is specific to a single object file, and only kept around temporarily
 /// during a call to [Linker::add_object].)
 /// This is used to figure out where relocations are taking place.
 struct SymbolOffsetMap {
@@ -353,6 +359,7 @@ impl SymbolOffsetMap {
 }
 
 /// Graph of which symbols depend on which symbols.
+///
 /// This is needed so we don't emit anything for unused symbols.
 struct SymbolGraph {
 	graph: Vec<Vec<SymbolId>>,
@@ -809,7 +816,7 @@ impl<'a> Linker<'a> {
 					addend: rel.addend,
 				});
 			} else {
-				self.emit_warning(LinkWarning::RelNoData(
+				self.emit_warning(LinkWarning::RelNoSym(
 					self.source_name(source_id).into(),
 					rel.entry_offset,
 				));
@@ -905,6 +912,11 @@ impl<'a> Linker<'a> {
 		// guarantee failure if apply_offset can't be converted to usize.
 		let apply_start = apply_offset.try_into().unwrap_or(usize::MAX - 1000);
 
+		fn u32_from_le_slice(data: &[u8]) -> u32 {
+			u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+		}
+		
+
 		match apply_symbol_info.value {
 			Data(_) => {
 				let mut in_bounds = true;
@@ -927,7 +939,7 @@ impl<'a> Linker<'a> {
 				}
 			}
 			_ => {
-				self.emit_warning(LinkWarning::RelNoData(
+				self.emit_warning(LinkWarning::RelNoSym(
 					self.source_name(rel.source_id).into(),
 					apply_offset,
 				));

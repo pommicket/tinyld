@@ -2,8 +2,8 @@
 @TODO:
 - bounds check on bss
 - make bss optional
-- finish docs
 - disable "warning: relocation XXX not in a data/text section" for .rel.eh_frame
+    - these warnings are being generated in two places. do they need to be?
 - make sure --no-stdlib generates a tiny executable
 - make executables more tiny (overlap sections, etc.)
 - static libraries
@@ -18,7 +18,6 @@ compile_error! {"WHY do you have a big endian machine???? it's the 21st century,
 
 mod elf;
 pub mod linker;
-mod util;
 
 #[derive(Parser, Debug)]
 struct Args {

@@ -419,32 +419,45 @@ impl RelType {
 
 pub struct Relocation {
 	pub r#type: RelType,
-	pub entry_offset: u64, // file offset of relocation metadata (for debugging)
-	pub offset: u64, // where the relocation should be applied. for ET_REL, this is a file offset; otherwise, it's an address.
+	/// file offset of relocation metadata (for debugging)
+	pub entry_offset: u64, 
+	/// where the relocation should be applied. for [ET_REL], this is a file offset; otherwise, it's an address.
+	pub offset: u64,
+	/// symbol which should be inserted at the offset.
 	pub symbol: Symbol,
+	/// to be added to the symbol's value
 	pub addend: i64,
 }
 
+/// There are multiple formats of ELF file (32-bit/64-bit, little/big-endian),
+/// so we can make types which read those formats derive from this trait.
 pub trait Reader
 where
 	Self: Sized,
 {
-	fn new<T: BufRead + Seek>(reader: T) -> Result<Self>;
+	fn new(reader: impl BufRead + Seek) -> Result<Self>;
 	fn r#type(&self) -> Type;
 	fn machine(&self) -> Machine;
 	fn entry(&self) -> u64;
 	fn symbols(&self) -> &[Symbol];
 	fn relocations(&self) -> &[Relocation];
 	fn symbol_name(&self, sym: &Symbol) -> Result<String>;
+	/// type of section with index `idx`
 	fn section_type(&self, idx: u16) -> Option<SectionType>;
+	/// read data from the section with index `idx` at offset `offset`.
 	fn read_section_data_exact(&self, idx: u16, offset: u64, data: &mut [u8]) -> Result<()>;
 }
 
+/// reader for 32-bit little-endian ELF files.
 pub struct Reader32LE {
 	ehdr: Ehdr32,
 	shdrs: Vec<Shdr32>,
 	symbols: Vec<Symbol>,
+	/// index of .strtab section
 	strtab_idx: Option<u16>,
+	/// All data of all sections.
+	/// We put it all in memory.
+	/// Object files usually aren't huge or anything.
 	section_data: Vec<Vec<u8>>,
 	relocations: Vec<Relocation>,
 }
@@ -461,7 +474,7 @@ impl Reader32LE {
 }
 
 impl Reader for Reader32LE {
-	fn new<T: BufRead + Seek>(mut reader: T) -> Result<Self> {
+	fn new(mut reader: impl BufRead + Seek) -> Result<Self> {
 		use Error::*;
 
 		let mut hdr_buf = [0; 0x34];
@@ -479,6 +492,7 @@ impl Reader for Reader32LE {
 		}
 
 		let mut shdrs = Vec::with_capacity(ehdr.shnum.into());
+		// read section headers
 		for i in 0..ehdr.shnum {
 			let offset = u64::from(ehdr.shoff) + u64::from(ehdr.shentsize) * u64::from(i);
 			reader.seek(io::SeekFrom::Start(offset))?;
@@ -487,7 +501,9 @@ impl Reader for Reader32LE {
 			shdrs.push(Shdr32::from_bytes(shdr_buf));
 		}
 
+		// symtabs[i] = symbol table in section #i , or vec![] if section #i isn't a symbol table.
 		let mut symtabs = Vec::with_capacity(ehdr.shnum.into());
+		// all the symbols
 		let mut symbols = vec![];
 		let mut section_data = Vec::with_capacity(ehdr.shnum.into());
 		let mut strtab_idx = None;
@@ -530,7 +546,7 @@ impl Reader for Reader32LE {
 						SHN_UNDEF => SymbolValue::Undefined,
 						SHN_ABS => SymbolValue::Absolute(sym.value.into()),
 						idx if idx < ehdr.shnum => {
-							if r#type == SymbolType::Section {
+							if r#type == SymbolType::Section && size == 0 {
 								// section symbols have a size of 0, it seems.
 								// i don't know why they don't just use the size of the section.
 								// i'm replacing it here. it makes the code easier to write.
