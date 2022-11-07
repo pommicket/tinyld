@@ -1,13 +1,26 @@
 /*!
 Linker producing small executables.
+Smallness is the *only* goal.
+This linker makes "bad" executables in many ways.
+You shouldn't use it unless all you want is a tiny little executable file.
+
+Currently, only 32-bit ELF is supported.
+If you are using C, you will need `gcc-multilib` for the 32-bit headers.
+
+Position-independent code is NOT supported, and makes executables
+larger anyways. Make sure you compile with `-fno-pic` or equivalent.
 
 Example usage:
 ```
 let mut linker = Linker::new();
 linker.add_input("main.o")?;
 linker.add_input("libc.so.6")?;
-linker.link_to_file("a.out")?;
+linker.link_to_file("a.out", "entry")?;
 ```
+
+`.eh_frame` and any debugging information is ignored.
+As such, the resulting executable will be difficult to debug and *C++ exceptions
+may not work*. 
 */
 
 use crate::{elf, util};
@@ -412,6 +425,7 @@ impl LinkerOutput {
 		self.interp.push(b'\0');
 	}
 
+	/// returns offset into strtab
 	fn add_string(&mut self, s: &str) -> u64 {
 		let ret = self.strtab.len() as u64;
 		self.strtab.extend(s.as_bytes());
@@ -487,7 +501,7 @@ impl LinkerOutput {
 		self.data.extend(data);
 	}
 
-	/// Get offset in data section where relocation should be applied.
+	/// get offset in data section where relocation should be applied
 	pub fn get_rel_data_offset(&self, rel: &Relocation) -> Option<u64> {
 		let apply_symbol = rel.r#where.0;
 		let r = self.symbol_data_offsets.get(&apply_symbol)?;
@@ -689,7 +703,7 @@ impl<'a> Linker<'a> {
 	}
 
 	/// Set function to be called when there is a warning.
-	/// By default, warnings are sent to stderr.
+	/// By default, warnings are printed to stderr.
 	pub fn set_warning_handler<T: Fn(LinkWarning) + 'a>(&mut self, warn: T) {
 		self.warn = Box::new(warn);
 	}
@@ -763,10 +777,10 @@ impl<'a> Linker<'a> {
 	/// add an object file (.o).
 	/// name doesn't need to correspond to the actual file name.
 	/// it only exists for debugging purposes.
-	pub fn add_object<T: BufRead + Seek>(
+	pub fn add_object(
 		&mut self,
 		name: &str,
-		reader: T,
+		reader: impl BufRead + Seek,
 	) -> Result<(), ObjectError> {
 		use ObjectError::*;
 
@@ -806,13 +820,13 @@ impl<'a> Linker<'a> {
 	}
 
 	/// Add a dynamic library (.so). `name` can be a full path or
-	/// something like "libc.so.6".
+	/// something like "libc.so.6" --- any string you would pass to `dlopen`.
 	pub fn add_dynamic_library(&mut self, name: &str) -> Result<(), ObjectError> {
 		self.libraries.push(name.into());
 		Ok(())
 	}
 
-	/// Get name of symbol if possible.
+	/// Get name of symbol.
 	fn symbol_name_str(&self, id: SymbolName) -> &str {
 		self.symbol_names.get_str(id).unwrap_or("???")
 	}
@@ -828,7 +842,7 @@ impl<'a> Linker<'a> {
 		self.symbols.get_id_from_name(source_id, name)
 	}
 
-	/// Generates a string like main.c:some_function.
+	/// Generates a string like "main.c:some_function".
 	fn symbol_id_location_string(&self, id: SymbolId) -> String {
 		let (source, name) = self.symbols.get_location_from_id(id);
 		format!(
@@ -844,21 +858,23 @@ impl<'a> Linker<'a> {
 		exec.eval_symbol_value(sym, &info.value)
 	}
 
-	/// Apply relocation to data.
-	/// Returns `Ok(true)` if the relocation was dealt with, and
-	/// `Ok(false)` if the symbol is not defined (so it needs to be loaded from a dynamic library).
-	fn apply_relocation(&self, exec: &mut LinkerOutput, rel: &Relocation) -> LinkResult<bool> {
+	/// Apply relocation to executable.
+	fn apply_relocation(&self, exec: &mut LinkerOutput, rel: &Relocation) -> LinkResult<()> {
 		let apply_symbol = rel.r#where.0;
 		let apply_offset = match exec.get_rel_data_offset(rel) {
 			Some(data_offset) => data_offset,
-			None => return Ok(true), // this relocation isn't in a data section so there's nothing we can do about it
+			None => {
+				// this relocation isn't in a data section so there's nothing we can do about it
+				return Ok(());
+			}
 		};
 		let pc = apply_offset + exec.data_addr();
 
 		let symbol = match self.get_symbol_id(rel.source_id, rel.sym) {
 			None => {
 				// symbol not defined. it should come from a library.
-				return Ok(false);
+				exec.add_relocation(&self.symbol_names, rel, exec.data_addr() + apply_offset);
+				return Ok(());
 			}
 			Some(sym) => sym,
 		};
@@ -878,7 +894,7 @@ impl<'a> Linker<'a> {
 			Pc32 => U32(symbol_value as u32 + addend as u32 - pc as u32),
 			Other(x) => {
 				self.emit_warning(LinkWarning::RelUnsupported(x));
-				return Ok(true);
+				return Ok(());
 			}
 		};
 
@@ -918,7 +934,7 @@ impl<'a> Linker<'a> {
 			}
 		}
 
-		Ok(true)
+		Ok(())
 	}
 
 	/// Easy input API.
@@ -989,8 +1005,6 @@ impl<'a> Linker<'a> {
 	}
 
 	/// Link everything together.
-	/// Currently this drops `self` (you probably don't need to link multiple times).
-	/// That might change in a future version.
 	pub fn link(&self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
 		let mut symbol_graph = SymbolGraph::new(self.symbols.count());
 
@@ -1023,18 +1037,18 @@ impl<'a> Linker<'a> {
 		self.add_data_for_symbol(&mut exec, &symbol_graph, entry_id)?;
 
 		for rel in self.relocations.iter() {
-			if !self.apply_relocation(&mut exec, rel)? {
-				// dynamic library relocation
-				if let Some(data_offset) = exec.get_rel_data_offset(rel) {
-					exec.add_relocation(&self.symbol_names, rel, exec.data_addr() + data_offset);
-				}
-			}
+			self.apply_relocation(&mut exec, rel)?;
 		}
 
 		exec.write(out)
 	}
 
 	/// Easy linking API. Just provide a path and the name of the entry function.
+	///
+	/// Important: don't just go writing a C program and defining `int main(int argc, char **argv)`.
+	/// Instead, define `void <main/entry/something_else>(void)`, and make sure you call `exit`,
+	/// or do an exit system interrupt at the end of the function --- if you just return,
+	/// you'll get a segmentation fault.
 	pub fn link_to_file(&self, path: impl AsRef<path::Path>, entry: &str) -> Result<(), String> {
 		let path = path.as_ref();
 		let mut out_options = fs::OpenOptions::new();

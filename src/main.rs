@@ -1,17 +1,14 @@
 /*
 @TODO:
-- move symbol_data_offsets stuff inside LinkerOutput
 - bounds check on bss
 - make bss optional
 - finish docs
+- disable "warning: relocation XXX not in a data/text section" for .rel.eh_frame
 - make sure --no-stdlib generates a tiny executable
 - make executables more tiny (overlap sections, etc.)
 - static libraries
 */
 
-// you will need gcc-multilib to compile a 32-bit executable (with stdlib)
-// you need to use -fno-pic with gcc -- got,plt relocations aren't supported
-// and also make the executable bigger.
 extern crate clap;
 
 use clap::Parser;
