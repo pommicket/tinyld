@@ -1,5 +1,6 @@
 /*!
 Linker producing small executables.
+
 Smallness is the *only* goal.
 This linker makes "bad" executables in many ways. For example,
 all initialized data will be executable. All code will be writable.
