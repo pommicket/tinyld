@@ -196,8 +196,8 @@ struct SymbolInfo {
 struct Symbols {
 	/// `info[n]` = symbol info corresponding to ID #`n`
 	info: Vec<SymbolInfo>,
-	/// mapping from symbol ID to source where it was defined + symbol name
-	locations: HashMap<SymbolId, (SourceId, SymbolName)>,
+	/// `locations[n]` = where symbol with ID `n` was defined + symbol name
+	locations: Vec<(SourceId, SymbolName)>,
 	/// all global symbols
 	global: HashMap<SymbolName, SymbolId>,
 	/// all weak symbols (weak symbols are like global symbols but have lower precedence)
@@ -210,17 +210,17 @@ impl Symbols {
 	fn new() -> Self {
 		Self {
 			info: vec![],
+			locations: vec![],
 			global: HashMap::new(),
 			weak: HashMap::new(),
 			local: HashMap::new(),
-			locations: HashMap::new(),
 		}
 	}
 
 	fn add_(&mut self, source: SourceId, name: SymbolName, info: SymbolInfo) -> SymbolId {
 		let id = SymbolId(self.info.len() as _);
 		self.info.push(info);
-		self.locations.insert(id, (source, name));
+		self.locations.push((source, name));
 		id
 	}
 
@@ -265,7 +265,7 @@ impl Symbols {
 	}
 
 	fn get_location_from_id(&self, id: SymbolId) -> (SourceId, SymbolName) {
-		*self.locations.get(&id).expect("bad symbol ID")
+		*self.locations.get(id.0 as usize).expect("bad symbol ID")
 	}
 
 	/// Number of defined symbols.
@@ -351,13 +351,16 @@ impl SymbolGraph {
 			graph: vec![vec![]; symbol_count],
 		}
 	}
-	
+
 	fn add_dependency(&mut self, sym: SymbolId, depends_on: SymbolId) {
-		self.graph[sym.0 as usize].push(depends_on);
+		self.graph
+			.get_mut(sym.0 as usize)
+			.expect("bad symbol ID")
+			.push(depends_on);
 	}
-	
+
 	fn get_dependencies(&self, sym: SymbolId) -> &[SymbolId] {
-		&self.graph[sym.0 as usize]
+		self.graph.get(sym.0 as usize).expect("bad symbol ID")
 	}
 }
 
