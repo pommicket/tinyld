@@ -194,7 +194,7 @@ struct SymbolInfo {
 
 /// information about all symbols in all sources
 struct Symbols {
-	/// info[n] = symbol info corresponding to ID #n
+	/// `info[n]` = symbol info corresponding to ID #`n`
 	info: Vec<SymbolInfo>,
 	/// mapping from symbol ID to source where it was defined + symbol name
 	locations: HashMap<SymbolId, (SourceId, SymbolName)>,
@@ -250,8 +250,8 @@ impl Symbols {
 	}
 
 	/// Get symbol ID from source and symbol name. The source ID is needed
-	/// for local symbols -- to find a global symbol with a given name you can
-	/// pass in [SymbolID::NONE].
+	/// for local symbols -- to find a global/weak symbol with a given name,
+	/// ignoring local symbols, you can pass in [SourceId::NONE].
 	///
 	/// The precedence rules according to ELF are: local then global then weak.
 	///
@@ -291,16 +291,23 @@ pub struct Linker<'a> {
 	symbols: Symbols,
 	symbol_names: SymbolNames,
 	relocations: Vec<Relocation>,
-	sources: Vec<String>, // object files
+	/// `sources[n]` = name of source corresponding to [SourceId]`(n)`.
+	/// These aren't necessarily valid paths. They're just names
+	/// we can use in error messages.
+	sources: Vec<String>,
+	/// dynamic libraries which have been added.
 	libraries: Vec<String>,
 	/// Output bss size.
 	/// As more objects are added, this grows.
 	bss_size: u64,
+	/// Warning callback.
 	warn: Box<dyn Fn(LinkWarning) + 'a>,
 }
 
-// this maps between offsets in an object file and symbols defined in that file.
-// this is used to figure out where relocations are taking place.
+/// maps between offsets in an object file and symbols defined in that file.
+/// (Note: it is specific to a single object file, and only kept around temporarily
+/// during a call to [Linker::add_object].)
+/// This is used to figure out where relocations are taking place.
 struct SymbolOffsetMap {
 	map: BTreeMap<(u64, u64), SymbolId>,
 }
@@ -318,8 +325,8 @@ impl SymbolOffsetMap {
 		}
 	}
 
-	// returns symbol, offset in symbol.
-	// e.g. a relocation might happen at main+0x33.
+	/// returns (symbol, offset in symbol).
+	/// e.g. a relocation might happen at `main+0x33`.
 	fn get(&self, offset: u64) -> Option<(SymbolId, u64)> {
 		let mut r = self.map.range(..(offset, u64::MAX));
 		let (key, value) = r.next_back()?;
@@ -332,21 +339,47 @@ impl SymbolOffsetMap {
 	}
 }
 
-// graph of which symbols use which symbols
-// this is needed so we don't emit anything for unused symbols.
-type SymbolGraph = HashMap<SymbolId, Vec<SymbolId>>;
+/// Graph of which symbols depend on which symbols.
+/// This is needed so we don't emit anything for unused symbols.
+struct SymbolGraph {
+	graph: Vec<Vec<SymbolId>>,
+}
+
+impl SymbolGraph {
+	fn new(symbol_count: usize) -> Self {
+		Self {
+			graph: vec![vec![]; symbol_count],
+		}
+	}
+	
+	fn add_dependency(&mut self, sym: SymbolId, depends_on: SymbolId) {
+		self.graph[sym.0 as usize].push(depends_on);
+	}
+	
+	fn get_dependencies(&self, sym: SymbolId) -> &[SymbolId] {
+		&self.graph[sym.0 as usize]
+	}
+}
 
 struct LinkerOutput {
 	/// for symbols with data, this holds the offsets into the data segment.
 	symbol_data_offsets: HashMap<SymbolId, u64>,
 	interp: Vec<u8>,
+	/// virtual address of big ol' section containing data + elf header + etc.
 	load_addr: u64,
+	/// .bss section address and size if there is one.
 	bss: Option<(u64, u64)>,
 	/// these bytes will make up the text+data section of our executable.
 	data: Vec<u8>,
+	/// array of (relocation, apply address).
+	/// These are only relocations which weren't applied by the linker
+	/// and need to be loaded from dynamic libraries.
 	relocations: Vec<(Relocation, u64)>,
+	/// contents of dynamic strtab.
 	strtab: Vec<u8>,
+	/// offsets into dynamic strtab where symbol names appear.
 	symbol_strtab_offsets: HashMap<SymbolName, u64>,
+	/// array of stratb pointers to library names.
 	lib_strtab_offsets: Vec<u64>,
 }
 
@@ -365,10 +398,12 @@ impl LinkerOutput {
 		}
 	}
 
+	/// add a bss section, or replace the existing one.
 	pub fn set_bss(&mut self, addr: u64, size: u64) {
 		self.bss = Some((addr, size));
 	}
 
+	/// set the ELF interpreter (typically `/lib/ld-linux.so.2`)
 	pub fn set_interp(&mut self, interp: &str) {
 		self.interp = interp.as_bytes().into();
 		self.interp.push(b'\0');
@@ -381,11 +416,13 @@ impl LinkerOutput {
 		ret
 	}
 
-	pub fn add_lib(&mut self, lib: &str) {
+	/// add a dynamic library
+	pub fn add_library(&mut self, lib: &str) {
 		let s = self.add_string(lib);
 		self.lib_strtab_offsets.push(s);
 	}
 
+	/// add a relocation (used for dynamic library relocations only)
 	pub fn add_relocation(&mut self, symbol_names: &SymbolNames, rel: &Relocation, addr: u64) {
 		let name = rel.sym;
 
@@ -397,6 +434,7 @@ impl LinkerOutput {
 		self.relocations.push((rel.clone(), addr));
 	}
 
+	/// number of segments in output ELF file, according to current information.
 	fn segment_count(&self) -> u16 {
 		let mut count = 1 /*data*/;
 		if !self.interp.is_empty() {
@@ -408,31 +446,36 @@ impl LinkerOutput {
 		count
 	}
 
+	/// offset of program headers
 	fn ph_offset(&self) -> u64 {
 		elf::Ehdr32::size_of() as u64
 	}
 
+	/// size of program headers
 	fn ph_size(&self) -> u64 {
 		elf::Phdr32::size_of() as u64 * u64::from(self.segment_count())
 	}
 
+	/// offset of data
 	fn data_offset(&self) -> u64 {
 		self.ph_offset() + self.ph_size()
 	}
 
+	/// virtual address of data
 	pub fn data_addr(&self) -> u64 {
 		self.load_addr + self.data_offset()
 	}
 
+	/// virtual address of bss
 	pub fn bss_addr(&self) -> Option<u64> {
 		self.bss.map(|(a, _)| a)
 	}
-	
+
 	/// has a data symbol been added with this ID?
 	pub fn is_data_symbol(&self, id: SymbolId) -> bool {
 		self.symbol_data_offsets.contains_key(&id)
 	}
-	
+
 	/// add some data to the executable, and associate it with the given symbol ID.
 	pub fn add_data_symbol(&mut self, id: SymbolId, data: &[u8]) {
 		// set address
@@ -440,14 +483,15 @@ impl LinkerOutput {
 		// add data
 		self.data.extend(data);
 	}
-	
+
 	/// Get offset in data section where relocation should be applied.
 	pub fn get_rel_data_offset(&self, rel: &Relocation) -> Option<u64> {
 		let apply_symbol = rel.r#where.0;
 		let r = self.symbol_data_offsets.get(&apply_symbol)?;
 		Some(*r + rel.r#where.1)
 	}
-	
+
+	/// get the actual value of a [SymbolValue]
 	pub fn eval_symbol_value(&self, id: SymbolId, value: &SymbolValue) -> u64 {
 		use SymbolValue::*;
 		match value {
@@ -466,6 +510,7 @@ impl LinkerOutput {
 		}
 	}
 
+	/// output the executable.
 	pub fn write(&self, mut out: impl Write + Seek) -> LinkResult<()> {
 		let load_addr = self.load_addr as u32;
 
@@ -636,7 +681,7 @@ impl LinkerOutput {
 }
 
 impl<'a> Linker<'a> {
-	fn default_warn_handler(warning: LinkWarning) {
+	fn default_warning_handler(warning: LinkWarning) {
 		eprintln!("warning: {warning}");
 	}
 
@@ -654,7 +699,7 @@ impl<'a> Linker<'a> {
 			relocations: vec![],
 			sources: vec![],
 			libraries: vec![],
-			warn: Box::new(Self::default_warn_handler),
+			warn: Box::new(Self::default_warning_handler),
 		}
 	}
 
@@ -663,6 +708,7 @@ impl<'a> Linker<'a> {
 		&self.sources[id.0 as usize]
 	}
 
+	/// add a symbol from a source file.
 	fn add_symbol(
 		&mut self,
 		source: SourceId,
@@ -758,7 +804,7 @@ impl<'a> Linker<'a> {
 
 	/// Add a dynamic library (.so). `name` can be a full path or
 	/// something like "libc.so.6".
-	pub fn add_library(&mut self, name: &str) -> Result<(), ObjectError> {
+	pub fn add_dynamic_library(&mut self, name: &str) -> Result<(), ObjectError> {
 		self.libraries.push(name.into());
 		Ok(())
 	}
@@ -800,7 +846,7 @@ impl<'a> Linker<'a> {
 	/// `Ok(false)` if the symbol is not defined (so it needs to be loaded from a dynamic library).
 	fn apply_relocation(&self, exec: &mut LinkerOutput, rel: &Relocation) -> LinkResult<bool> {
 		let apply_symbol = rel.r#where.0;
-		let apply_offset = match exec.get_rel_data_offset(&rel) {
+		let apply_offset = match exec.get_rel_data_offset(rel) {
 			Some(data_offset) => data_offset,
 			None => return Ok(true), // this relocation isn't in a data section so there's nothing we can do about it
 		};
@@ -906,14 +952,16 @@ impl<'a> Linker<'a> {
 					.map_err(|e| format!("Failed to process object file {input}: {e}"))
 			}
 			DynamicLibrary => self
-				.add_library(input)
+				.add_dynamic_library(input)
 				.map_err(|e| format!("Failed to process library file {input}: {e}")),
 			Other => Err(format!("Unrecognized file type: {input}")),
 		}
 	}
 
-	// we don't want to link unused symbols.
-	// we start by calling this on the entry function, then it recursively calls itself for each symbol used.
+	/// Add data for a symbol.
+	/// We don't want to link unused symbols.
+	/// We start by calling this on the entry function,
+	/// then it recursively calls itself for each symbol used.
 	fn add_data_for_symbol(
 		&self,
 		exec: &mut LinkerOutput,
@@ -930,7 +978,7 @@ impl<'a> Linker<'a> {
 			exec.add_data_symbol(id, d);
 		}
 
-		for reference in symbol_graph.get(&id).unwrap_or(&vec![]) {
+		for reference in symbol_graph.get_dependencies(id) {
 			self.add_data_for_symbol(exec, symbol_graph, *reference)?;
 		}
 
@@ -941,21 +989,13 @@ impl<'a> Linker<'a> {
 	/// Currently this drops `self` (you probably don't need to link multiple times).
 	/// That might change in a future version.
 	pub fn link(&self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
-		let mut symbol_graph = SymbolGraph::with_capacity(self.symbols.count());
+		let mut symbol_graph = SymbolGraph::new(self.symbols.count());
 
 		// compute symbol graph
 		for rel in self.relocations.iter() {
-			use std::collections::hash_map::Entry;
 			if let Some(symbol) = self.get_symbol_id(rel.source_id, rel.sym) {
 				let apply_symbol = rel.r#where.0;
-				match symbol_graph.entry(apply_symbol) {
-					Entry::Occupied(mut o) => {
-						o.get_mut().push(symbol);
-					}
-					Entry::Vacant(v) => {
-						v.insert(vec![symbol]);
-					}
-				}
+				symbol_graph.add_dependency(apply_symbol, symbol);
 			}
 		}
 
@@ -965,7 +1005,7 @@ impl<'a> Linker<'a> {
 		exec.set_bss(0x70000000, self.bss_size);
 		exec.set_interp("/lib/ld-linux.so.2");
 		for lib in self.libraries.iter() {
-			exec.add_lib(lib);
+			exec.add_library(lib);
 		}
 
 		let entry_name_id = self
@@ -991,7 +1031,7 @@ impl<'a> Linker<'a> {
 		exec.write(out)
 	}
 
-	/// Easy linking API. Just provide a path.
+	/// Easy linking API. Just provide a path and the name of the entry function.
 	pub fn link_to_file(&self, path: impl AsRef<path::Path>, entry: &str) -> Result<(), String> {
 		let path = path.as_ref();
 		let mut out_options = fs::OpenOptions::new();
@@ -1013,7 +1053,6 @@ impl<'a> Linker<'a> {
 }
 
 impl<'a> Default for Linker<'a> {
-	/// mostly so clippy doesn't complain
 	fn default() -> Self {
 		Self::new()
 	}

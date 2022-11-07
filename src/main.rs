@@ -6,6 +6,7 @@
 - finish docs
 - make sure --no-stdlib generates a tiny executable
 - make executables more tiny (overlap sections, etc.)
+- static libraries
 */
 
 // you will need gcc-multilib to compile a 32-bit executable (with stdlib)
