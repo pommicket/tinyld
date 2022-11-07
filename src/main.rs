@@ -10,6 +10,7 @@
 
 extern crate clap;
 
+use std::env;
 use clap::Parser;
 
 #[cfg(target_endian = "big")]
@@ -27,6 +28,11 @@ struct Args {
 	/// This makes the executable smaller.
 	#[arg(long = "no-stdlib", default_value_t = false)]
 	no_std_lib: bool,
+	/// If set, the program will be linked against libstdc++.
+	///
+	/// This is needed when using the standard template library.
+	#[arg(long = "stdc++", default_value_t = false)]
+	std_cpp: bool,
 	/// Output executable path.
 	#[arg(short = 'o', long = "output", default_value = "a.out")]
 	output: String,
@@ -36,6 +42,29 @@ struct Args {
 	/// :3
 	#[arg(long = "nya")]
 	nya: bool,
+	/// C compiler
+	///
+	/// First this is checked, then the `CC` environment variable,
+	/// then if both aren't set, (/usr/bin/)cc is used.
+	#[arg(long = "cc", default_value = "auto")]
+	cc: String,
+	/// C compiler flags
+	///
+	/// The C compiler is invoked using `(cc) (cflags) (C file) -o (object file)`
+	#[arg(long = "cflags", default_values = linker::Linker::DEFAULT_CFLAGS)]
+	cflags: Vec<String>,
+}
+
+impl Args {
+	fn get_c_compiler(&self) -> String {
+		if self.cc != "auto" {
+			self.cc.clone()
+		} else if let Ok(env_cc) = env::var("CC") {
+			env_cc
+		} else {
+			"cc".into()
+		}
+	}
 }
 
 fn main_() -> Result<(), String> {
@@ -49,6 +78,8 @@ fn main_() -> Result<(), String> {
 	let inputs = &args.inputs;
 
 	let mut linker = linker::Linker::new();
+	
+	linker.set_cc(&args.get_c_compiler());
 
 	let warning_handler = |w| {
 		// termcolor is a goddamn nightmare to use
@@ -69,6 +100,9 @@ fn main_() -> Result<(), String> {
 
 	if !args.no_std_lib {
 		linker.add_input("libc.so.6")?;
+	}
+	if args.std_cpp {
+		linker.add_input("libstdc++.so.6")?;
 	}
 
 	for input in inputs.iter() {

@@ -17,6 +17,7 @@ Example usage:
 let mut linker = Linker::new();
 linker.add_input("main.o")?;
 linker.add_input("libc.so.6")?;
+linker.add_input("libstdc++.so.6")?;
 linker.link_to_file("a.out", "entry")?;
 ```
 
@@ -113,10 +114,19 @@ impl From<&LinkWarning> for String {
 
 /// error produced by [Linker::add_object]
 pub enum ObjectError {
+	IO(io::Error),
 	/// ELF format error
 	Elf(elf::Error),
 	/// wrong type of ELF file
 	BadType,
+	/// compile command failed
+	CommandFailed(std::process::ExitStatus),
+}
+
+impl From<io::Error> for ObjectError {
+	fn from(e: io::Error) -> Self {
+		Self::IO(e)
+	}
 }
 
 impl From<elf::Error> for ObjectError {
@@ -135,10 +145,10 @@ impl fmt::Display for ObjectError {
 	fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
 		use ObjectError::*;
 		match self {
-			// Display for UnexpectedEof *should* be this but is less clear
-			//  ("failed to fill whole buffer")
+			IO(e) => write!(f, "{e}"),
 			Elf(e) => write!(f, "{e}"),
 			BadType => write!(f, "wrong type of ELF file (not an object file)"),
+			CommandFailed(status) => write!(f, "command failed: {status}"),
 		}
 	}
 }
@@ -324,6 +334,14 @@ struct Relocation {
 pub struct Linker<'a> {
 	symbols: Symbols,
 	symbol_names: SymbolNames,
+	/// C compiler
+	cc: String,
+	/// C compiler flags
+	cflags: Vec<String>,
+	/// C++ compiler
+	cxx: String,
+	/// C++ compiler flags
+	cxxflags: Vec<String>,
 	relocations: Vec<Relocation>,
 	/// `sources[n]` = name of source corresponding to [SourceId]`(n)`.
 	/// These aren't necessarily valid paths. They're just names
@@ -726,6 +744,9 @@ impl LinkerOutput {
 }
 
 impl<'a> Linker<'a> {
+	pub const DEFAULT_CFLAGS: [&str; 5] = ["-Wall", "-Os", "-m32", "-fno-pic", "-c"];
+	pub const DEFAULT_CXXFLAGS: [&str; 5] = Self::DEFAULT_CFLAGS;
+	
 	fn default_warning_handler(warning: LinkWarning) {
 		eprintln!("warning: {warning}");
 	}
@@ -741,11 +762,41 @@ impl<'a> Linker<'a> {
 			symbols: Symbols::new(),
 			symbol_names: SymbolNames::new(),
 			bss_size: 0,
+			cc: "cc".into(),
+			cxx: "c++".into(),
+			cflags: Self::DEFAULT_CFLAGS.iter().map(|&r| r.into()).collect(),
+			cxxflags: Self::DEFAULT_CXXFLAGS.iter().map(|&r| r.into()).collect(),
 			relocations: vec![],
 			sources: vec![],
 			libraries: vec![],
 			warn: Box::new(Self::default_warning_handler),
 		}
+	}
+	
+	/// Set the C compiler.
+	pub fn set_cc(&mut self, cc: &str) {
+		self.cc = cc.into();
+	}
+
+	/// Set the C compiler flags.
+	///
+	/// These had better include something like `-c` and
+	/// something like `-fno-pic`.
+	pub fn set_cflags(&mut self, cflags: &[String]) {
+		self.cflags = cflags.to_vec();
+	}
+	
+	/// Set the C++ compiler.
+	pub fn set_cxx(&mut self, cxx: &str) {
+		self.cxx = cxx.into();
+	}
+
+	/// Set the C++ compiler flags.
+	///
+	/// These had better include something like `-c` and
+	/// something like `-fno-pic`.
+	pub fn set_cxxflags(&mut self, cxxflags: &[String]) {
+		self.cxxflags = cxxflags.to_vec();
 	}
 
 	/// Get name of source file.
@@ -848,11 +899,103 @@ impl<'a> Linker<'a> {
 		Ok(())
 	}
 
+	pub fn add_object_from_file(&mut self, path: impl AsRef<path::Path>) -> Result<(), ObjectError> {
+		let path = path.as_ref();
+		let file = fs::File::open(path)?;
+		let mut file = io::BufReader::new(file);
+		self.add_object(&path.to_string_lossy(), &mut file)
+	}
+
 	/// Add a dynamic library (.so). `name` can be a full path or
 	/// something like "libc.so.6" --- any string you would pass to `dlopen`.
 	pub fn add_dynamic_library(&mut self, name: &str) -> Result<(), ObjectError> {
 		self.libraries.push(name.into());
 		Ok(())
+	}
+	
+	fn compile(&self, compiler: &str, flags: &[String], path: &str) -> Result<String, ObjectError> {
+		use std::process::Command;
+		
+		let ext_idx = path.rfind('.').unwrap_or(path.len());
+		let output_filename = path[..ext_idx].to_string() + ".o";
+		
+		let status = Command::new(compiler)
+			.args(flags)
+			.arg(path)
+			.arg("-o")
+			.arg(&output_filename)
+			.status()?;
+		if status.success() {
+			Ok(output_filename)
+		} else {
+			Err(ObjectError::CommandFailed(status))
+		}
+	}
+	
+	/// Add a C file (.c). This calls out to an external C compiler.
+	pub fn add_c(&mut self, path: &str) -> Result<(), ObjectError> {
+		let output = self.compile(&self.cc, &self.cflags, path)?;
+		self.add_object_from_file(&output)
+	}
+	
+	/// Add a C++ file (.cpp/.cc/etc). This calls out to an external C++ compiler.
+	pub fn add_cpp(&mut self, path: &str) -> Result<(), ObjectError> {
+		let output = self.compile(&self.cxx, &self.cxxflags, path)?;
+		self.add_object_from_file(&output)
+	}
+	
+	/// Easy input API.
+	/// Infers the file type of input, and calls the appropriate function (e.g. [Self::add_object]).
+	pub fn add_input(&mut self, input: &str) -> Result<(), String> {
+		enum FileType {
+			Object,
+			DynamicLibrary,
+			C,
+			CPlusPlus,
+			Other,
+		}
+
+		use FileType::*;
+
+		fn file_type(input: &str) -> FileType {
+			if input.ends_with(".o") {
+				return Object;
+			}
+			if input.ends_with(".c") {
+				return C;
+			}
+			if input.ends_with(".cpp") || input.ends_with(".cc") || input.ends_with(".cxx")
+				|| input.ends_with(".C") {
+				return CPlusPlus;
+			}
+			if input.ends_with(".so") {
+				return DynamicLibrary;
+			}
+			if input.contains(".so.") {
+				// e.g. libc.so.6, some_library.so.12.7.3
+				return DynamicLibrary;
+			}
+			Other
+		}
+
+		match file_type(input) {
+			Object => {
+				self.add_object_from_file(input)
+					.map_err(|e| format!("Failed to process object file {input}: {e}"))
+			}
+			C => {
+				self.add_c(input)
+					.map_err(|e| format!("Failed to process C file {input}: {e}"))
+			},
+			CPlusPlus => {
+				self.add_cpp(input)
+					.map_err(|e| format!("Failed to process C++ file {input}: {e}"))
+			},
+			DynamicLibrary => self
+				.add_dynamic_library(input)
+				.map_err(|e| format!("Failed to process library file {input}: {e}")),
+			Other => Err(format!("Unrecognized file type: {input}")),
+		}
 	}
 
 	/// Get name of symbol.
@@ -975,45 +1118,6 @@ impl<'a> Linker<'a> {
 		Ok(())
 	}
 
-	/// Easy input API.
-	/// Infers the file type of input, and calls the appropriate function (e.g. [Self::add_object]).
-	pub fn add_input(&mut self, input: &str) -> Result<(), String> {
-		enum FileType {
-			Object,
-			DynamicLibrary,
-			Other,
-		}
-
-		use FileType::*;
-
-		fn file_type(input: &str) -> FileType {
-			if input.ends_with(".o") {
-				return Object;
-			}
-			if input.ends_with(".so") {
-				return DynamicLibrary;
-			}
-			if input.contains(".so.") {
-				// e.g. libc.so.6, some_library.so.12.7.3
-				return DynamicLibrary;
-			}
-			Other
-		}
-
-		match file_type(input) {
-			Object => {
-				let file =
-					fs::File::open(input).map_err(|e| format!("Couldn't open {input}: {e}"))?;
-				let mut file = io::BufReader::new(file);
-				self.add_object(input, &mut file)
-					.map_err(|e| format!("Failed to process object file {input}: {e}"))
-			}
-			DynamicLibrary => self
-				.add_dynamic_library(input)
-				.map_err(|e| format!("Failed to process library file {input}: {e}")),
-			Other => Err(format!("Unrecognized file type: {input}")),
-		}
-	}
 
 	/// Add data for a symbol.
 	/// We don't want to link unused symbols.
