@@ -42,6 +42,19 @@ pub enum LinkError {
 	EntryNotDefined(String),
 }
 
+impl LinkError {
+	/// convert `u` to `u32`, returning [LinkError::TooLarge] if it overflows.
+	fn u64_to_u32(u: u64) -> LinkResult<u32> {
+		u.try_into().map_err(|_| LinkError::TooLarge)
+	}
+	
+	/// convert `u` to `u32`, returning [LinkError::TooLarge] if it overflows.
+	fn usize_to_u32(u: usize) -> LinkResult<u32> {
+		u.try_into().map_err(|_| LinkError::TooLarge)
+	}
+	
+}
+
 type LinkResult<T> = Result<T, LinkError>;
 
 impl fmt::Display for LinkError {
@@ -236,7 +249,7 @@ impl Symbols {
 	}
 
 	fn add_(&mut self, source: SourceId, name: SymbolName, info: SymbolInfo) -> SymbolId {
-		let id = SymbolId(self.info.len() as _);
+		let id = SymbolId(self.info.len().try_into().expect("too many symbols wtf is wrong with you"));
 		self.info.push(info);
 		self.locations.push((source, name));
 		id
@@ -476,7 +489,7 @@ impl LinkerOutput {
 
 	/// offset of program headers
 	fn ph_offset(&self) -> u64 {
-		elf::Ehdr32::size_of() as u64
+		elf::Ehdr32::size_of().into()
 	}
 
 	/// size of program headers
@@ -524,14 +537,15 @@ impl LinkerOutput {
 		use SymbolValue::*;
 		match value {
 			Data(_) => {
+				// in theory, this should never panic
 				self.symbol_data_offsets
 					.get(&id)
-					.unwrap() // @TODO: can this panic?
+					.expect("bad symbol ID")
 					+ self.data_addr()
 			}
 			Bss(x) => {
 				// this shouldn't panic, since we always generate a bss section
-				// @TODO: make bss optional
+				// if there are any BSS symbols.
 				self.bss_addr().expect("no bss") + x
 			}
 			Absolute(a) => *a,
@@ -540,7 +554,14 @@ impl LinkerOutput {
 
 	/// output the executable.
 	pub fn write(&self, mut out: impl Write + Seek) -> LinkResult<()> {
-		let load_addr = self.load_addr as u32;
+		let u64_to_u32 = LinkError::u64_to_u32;
+		let usize_to_u32 = LinkError::usize_to_u32;
+		
+		fn stream_position32(out: &mut impl Seek) -> LinkResult<u32> {
+			LinkError::u64_to_u32(out.stream_position()?)
+		}
+		
+		let load_addr = u64_to_u32(self.load_addr)?;
 
 		// start by writing data.
 		out.seek(io::SeekFrom::Start(self.data_offset()))?;
@@ -552,21 +573,21 @@ impl LinkerOutput {
 		let mut dyntab_size = 0;
 		if !self.interp.is_empty() {
 			// now interp
-			interp_offset = out.stream_position()?;
+			interp_offset = stream_position32(&mut out)?;
 			out.write_all(&self.interp)?;
-			interp_size = self.interp.len() as u32;
+			interp_size = usize_to_u32(self.interp.len())?;
 			// now strtab
-			let strtab_offset = out.stream_position()?;
+			let strtab_offset = stream_position32(&mut out)?;
 			out.write_all(&self.strtab)?;
 			// now symtab
-			let symtab_offset = out.stream_position()?;
+			let symtab_offset = stream_position32(&mut out)?;
 			let null_symbol = [0; mem::size_of::<elf::Sym32>()];
 			out.write_all(&null_symbol)?;
 			let mut symbols: HashMap<SymbolName, u32> = HashMap::new();
 			for (i, (sym, (strtab_offset, symbol_type))) in self.dynsyms.iter().enumerate() {
-				symbols.insert(*sym, (i + 1) as u32);
+				symbols.insert(*sym, usize_to_u32(i + 1)?);
 				let sym = elf::Sym32 {
-					name: *strtab_offset as u32,
+					name: u64_to_u32(*strtab_offset)?,
 					info: elf::STB_GLOBAL << 4 | u8::from(*symbol_type),
 					value: 0,
 					size: 0,
@@ -576,20 +597,20 @@ impl LinkerOutput {
 				out.write_all(&sym.to_bytes())?;
 			}
 			// now reltab
-			let reltab_offset = out.stream_position()?;
+			let reltab_offset = stream_position32(&mut out)?;
 			for (reloc, addr) in self.relocations.iter() {
 				let index = *symbols.get(&reloc.sym).unwrap();
 				let rel = elf::Rel32 {
-					offset: *addr as u32,
+					offset: u64_to_u32(*addr)?,
 					info: index << 8 | u32::from(reloc.r#type.to_x86_u8().unwrap()),
 				};
 				out.write_all(&rel.to_bytes())?;
 			}
-			let reltab_size = out.stream_position()? - reltab_offset;
+			let reltab_size = stream_position32(&mut out)? - reltab_offset;
 			// now hash
-			let hashtab_offset = out.stream_position()?;
+			let hashtab_offset = stream_position32(&mut out)?;
 			// put everything in a single bucket
-			let nsymbols = symbols.len() as u32;
+			let nsymbols = u64_to_u32(symbols.len() as u64)?;
 			out.write_all(&u32::to_le_bytes(1))?; // nbucket
 			out.write_all(&u32::to_le_bytes(nsymbols + 1))?; // nchain
 			out.write_all(&u32::to_le_bytes(0))?; // bucket begins at 0
@@ -602,51 +623,48 @@ impl LinkerOutput {
 			out.write_all(&u32::to_le_bytes(0))?;
 
 			// now dyntab
-			dyntab_offset = out.stream_position()?;
+			dyntab_offset = stream_position32(&mut out)?;
 			let mut dyn_data = vec![
 				elf::DT_RELSZ,
-				reltab_size as u32,
+				reltab_size,
 				elf::DT_RELENT,
 				8,
 				elf::DT_REL,
-				load_addr + reltab_offset as u32,
+				load_addr + reltab_offset,
 				elf::DT_STRSZ,
-				self.strtab.len() as u32,
+				usize_to_u32(self.strtab.len())?,
 				elf::DT_STRTAB,
-				load_addr + strtab_offset as u32,
+				load_addr + strtab_offset,
 				elf::DT_SYMENT,
 				16,
 				elf::DT_SYMTAB,
-				load_addr + symtab_offset as u32,
+				load_addr + symtab_offset,
 				elf::DT_HASH,
-				load_addr + hashtab_offset as u32,
+				load_addr + hashtab_offset,
 			];
 			for lib in &self.lib_strtab_offsets {
-				dyn_data.extend([elf::DT_NEEDED, *lib as u32]);
+				dyn_data.extend([elf::DT_NEEDED, u64_to_u32(*lib)?]);
 			}
 			dyn_data.extend([elf::DT_NULL, 0]);
 			let mut dyn_bytes = Vec::with_capacity(dyn_data.len() * 4);
 			for x in dyn_data {
 				dyn_bytes.extend(u32::to_le_bytes(x));
 			}
-			dyntab_size = dyn_bytes.len() as u32;
+			dyntab_size = usize_to_u32(dyn_bytes.len())?;
 			out.write_all(&dyn_bytes)?;
 		}
 
-		let file_size: u32 = out
-			.stream_position()?
-			.try_into()
-			.map_err(|_| LinkError::TooLarge)?;
+		let file_size: u32 = stream_position32(&mut out)?;
 
 		out.seek(io::SeekFrom::Start(0))?;
 
 		let ehdr = elf::Ehdr32 {
 			phnum: self.segment_count(),
-			phoff: elf::Ehdr32::size_of() as u32,
-			entry: self
-				.data_addr()
-				.try_into()
-				.map_err(|_| LinkError::TooLarge)?,
+			phoff: elf::Ehdr32::size_of().into(),
+			// apparently you're supposed to set this to zero if there are no sections.
+			// at least, that's what readelf seems to think.
+			shentsize: 0,
+			entry: u64_to_u32(self.data_addr())?,
 			..Default::default()
 		};
 		out.write_all(&ehdr.to_bytes())?;
@@ -664,14 +682,13 @@ impl LinkerOutput {
 		if let Some((bss_addr, bss_size)) = self.bss {
 			// for some reason, linux doesn't like executables
 			// with memsz > filesz != 0
-			// so we need two segments.
-			let bss_size: u32 = bss_size.try_into().map_err(|_| LinkError::TooLarge)?;
+			// so we do need two segments.
 			let phdr_bss = elf::Phdr32 {
 				flags: elf::PF_R | elf::PF_W, // read, write
 				offset: 0,
-				vaddr: bss_addr as u32,
+				vaddr: u64_to_u32(bss_addr)?,
 				filesz: 0,
-				memsz: bss_size as u32,
+				memsz: u64_to_u32(bss_size)?,
 				..Default::default()
 			};
 			out.write_all(&phdr_bss.to_bytes())?;
@@ -681,10 +698,10 @@ impl LinkerOutput {
 			let phdr_interp = elf::Phdr32 {
 				r#type: elf::PT_INTERP,
 				flags: elf::PF_R,
-				offset: interp_offset as u32,
-				vaddr: load_addr + interp_offset as u32,
-				filesz: interp_size as u32,
-				memsz: interp_size as u32,
+				offset: interp_offset,
+				vaddr: load_addr + interp_offset,
+				filesz: interp_size,
+				memsz: interp_size,
 				align: 1,
 				..Default::default()
 			};
@@ -693,10 +710,10 @@ impl LinkerOutput {
 			let phdr_dynamic = elf::Phdr32 {
 				r#type: elf::PT_DYNAMIC,
 				flags: elf::PF_R,
-				offset: dyntab_offset as u32,
-				vaddr: load_addr + dyntab_offset as u32,
-				filesz: dyntab_size as u32,
-				memsz: dyntab_size as u32,
+				offset: dyntab_offset,
+				vaddr: load_addr + dyntab_offset,
+				filesz: dyntab_size,
+				memsz: dyntab_size,
 				align: 1,
 				..Default::default()
 			};
@@ -899,10 +916,12 @@ impl<'a> Linker<'a> {
 		}
 		use elf::RelType::*;
 		use Value::*;
+		
+		let s_plus_a = symbol_value.wrapping_add(addend as u64);
 
 		let value = match rel.r#type {
-			Direct32 => U32(symbol_value as u32 + addend as u32),
-			Pc32 => U32(symbol_value as u32 + addend as u32 - pc as u32),
+			Direct32 => U32(LinkError::u64_to_u32(s_plus_a)?),
+			Pc32 => U32(LinkError::u64_to_u32(s_plus_a - pc)?),
 			Other(x) => {
 				self.emit_warning(LinkWarning::RelUnsupported(x));
 				return Ok(());
@@ -914,6 +933,7 @@ impl<'a> Linker<'a> {
 		use SymbolValue::*;
 
 		// guarantee failure if apply_offset can't be converted to usize.
+		// (this will probably never happen)
 		let apply_start = apply_offset.try_into().unwrap_or(usize::MAX - 1000);
 
 		fn u32_from_le_slice(data: &[u8]) -> u32 {
@@ -928,7 +948,8 @@ impl<'a> Linker<'a> {
 					U32(u) => {
 						if let Some(apply_to) = exec.data.get_mut(apply_start..apply_start + 4) {
 							let curr_val = u32_from_le_slice(apply_to);
-							apply_to.copy_from_slice(&(u + curr_val).to_le_bytes());
+							let new_val = u.wrapping_add(curr_val);
+							apply_to.copy_from_slice(&new_val.to_le_bytes());
 						} else {
 							in_bounds = false;
 						}
@@ -1035,10 +1056,14 @@ impl<'a> Linker<'a> {
 		let symbol_graph = symbol_graph; // no more mutating
 
 		let mut exec = LinkerOutput::new(0x400000);
-		exec.set_bss(0x70000000, self.bss_size);
-		exec.set_interp("/lib/ld-linux.so.2");
-		for lib in self.libraries.iter() {
-			exec.add_library(lib);
+		if self.bss_size > 0 {
+			exec.set_bss(0x70000000, self.bss_size);
+		}
+		if !self.libraries.is_empty() {
+			exec.set_interp("/lib/ld-linux.so.2");
+			for lib in self.libraries.iter() {
+				exec.add_library(lib);
+			}
 		}
 
 		let entry_name_id = self

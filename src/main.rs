@@ -1,11 +1,10 @@
 /*
 @TODO:
-- bounds check on bss
-- make bss optional
+- compile as well as link
 - disable "warning: relocation XXX not in a data/text section" for .rel.eh_frame
     - these warnings are being generated in two places. do they need to be?
-- make sure --no-stdlib generates a tiny executable
 - make executables more tiny (overlap sections, etc.)
+- generate a warning/error on position-independent object files
 - static libraries
 */
 
@@ -26,7 +25,7 @@ struct Args {
 	/// If set, the program will not be linked against libc.
 	///
 	/// This makes the executable smaller.
-	#[arg(long = "no-std-lib", default_value_t = false)]
+	#[arg(long = "no-stdlib", default_value_t = false)]
 	no_std_lib: bool,
 	/// Output executable path.
 	#[arg(short = 'o', long = "output", default_value = "a.out")]

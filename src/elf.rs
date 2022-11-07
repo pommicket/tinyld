@@ -109,8 +109,8 @@ impl Default for Ehdr32 {
 }
 
 impl Ehdr32 {
-	pub fn size_of() -> usize {
-		mem::size_of::<Self>()
+	pub fn size_of() -> u8 {
+		mem::size_of::<Self>() as u8
 	}
 }
 
@@ -537,7 +537,8 @@ impl Reader for Reader32LE {
 				let name = bytes_to_string(bytes)?;
 
 				if name == ".strtab" {
-					strtab_idx = Some(s_idx as u16);
+					// since shdrs.len() == ehdr.shnum, this should never panic.
+					strtab_idx = Some(s_idx.try_into().unwrap());
 				}
 			}
 
