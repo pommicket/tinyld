@@ -406,16 +406,16 @@ impl SourceRanges {
 		true
 	}
 	
-	fn get_value(&self, offset: u64) -> Option<u64> {
-		let (range, &value) = self.map.range(..=(offset, u64::MAX)).last()?;
+	fn translate_offset(&self, offset: u64) -> Option<u64> {
+		let (range, &out) = self.map.range(..=(offset, u64::MAX)).last()?;
 		if offset >= range.0 && offset < range.0 + range.1 {
-			Some(value)
+			Some(out + (offset - range.0))
 		} else {
 			None
 		}
 	}
 	
-	fn set_values(&mut self, size: &mut u64) {
+	fn set_output_offsets(&mut self, size: &mut u64) {
 		for (range, value) in self.map.iter_mut() {
 			// we should only call this function once
 			assert_eq!(*value, 0);
@@ -445,7 +445,7 @@ impl RangeSet {
 	fn to_map(mut self) -> OffsetMap {
 		let mut size = 0u64;
 		for range in self.ranges.iter_mut() {
-			range.set_values(&mut size)
+			range.set_output_offsets(&mut size)
 		}
 		OffsetMap {
 			size,
@@ -461,13 +461,13 @@ struct OffsetMap {
 }
 
 impl OffsetMap {
-	fn get(&self, src: SourceId, offset: u64) -> Option<u64> {
-		self.ranges[src.0 as usize].get_value(offset)
+	fn translate_offset(&self, src: SourceId, offset: u64) -> Option<u64> {
+		self.ranges[src.0 as usize].translate_offset(offset)
 	}
 	
 	/// get offset in data section where relocation should be applied
-	fn get_rel_data_offset(&self, rel: &Relocation) -> Option<u64> {
-		self.get(rel.r#where.0, rel.r#where.1)
+	fn translate_rel_offset(&self, rel: &Relocation) -> Option<u64> {
+		self.translate_offset(rel.r#where.0, rel.r#where.1)
 	}
 	
 	fn size(&self) -> u64 {
@@ -605,9 +605,9 @@ impl LinkerOutput {
 		use SymbolValue::*;
 		match value {
 			Data { source, offset, .. } => {
-				// in theory, this should never panic
-				map
-					.get(*source, *offset)
+				// in theory, this should never panic, because we compute OffsetMap
+				// to include all dependent symbols.
+				map.translate_offset(*source, *offset)
 					.unwrap()
 					+ self.data_addr()
 			}
@@ -621,7 +621,7 @@ impl LinkerOutput {
 	}
 
 	/// output the executable.
-	pub fn write(&self, mut out: impl Write + Seek) -> LinkResult<()> {
+	pub fn write(&self, mut out: impl Write + Seek, entry_point: u64) -> LinkResult<()> {
 		let u64_to_u32 = LinkError::u64_to_u32;
 		let usize_to_u32 = LinkError::usize_to_u32;
 		
@@ -732,7 +732,7 @@ impl LinkerOutput {
 			// apparently you're supposed to set this to zero if there are no sections.
 			// at least, that's what readelf seems to think.
 			shentsize: 0,
-			entry: u64_to_u32(self.data_addr())?,
+			entry: u64_to_u32(entry_point)?,
 			..Default::default()
 		};
 		out.write_all(&ehdr.to_bytes())?;
@@ -1049,7 +1049,7 @@ impl<'a> Linker<'a> {
 
 	/// Apply relocation to executable.
 	fn apply_relocation(&self, exec: &mut LinkerOutput, map: &OffsetMap, rel: &Relocation) -> LinkResult<()> {
-		let apply_offset = match map.get_rel_data_offset(rel) {
+		let apply_offset = match map.translate_rel_offset(rel) {
 			Some(data_offset) => data_offset,
 			None => {
 				// this relocation isn't in a data section so there's nothing we can do about it
@@ -1149,11 +1149,12 @@ impl<'a> Linker<'a> {
 		let mut ranges = RangeSet::new(self.sources.len());
 		
 		let entry_value = &self.symbols.get_info_from_id(entry_id).value;
-		if let SymbolValue::Data { source, offset, size } = entry_value {
-			self.require_range(&mut ranges, *source, *offset, *size);
-		} else {
-			return Err(LinkError::EntryNoData(entry.into()));
-		}
+		let (entry_source, entry_offset, entry_size) = match entry_value {
+			SymbolValue::Data { source, offset, size } => (*source, *offset, *size),
+			_ => return Err(LinkError::EntryNoData(entry.into())),
+		};
+		
+		self.require_range(&mut ranges, entry_source, entry_offset, entry_size);
 		
 		// compute offset map
 		let offset_map = ranges.to_map();
@@ -1165,10 +1166,14 @@ impl<'a> Linker<'a> {
 			let dest_end = dest_start + size as usize;
 			let src_start = src_offset as usize;
 			let src_end = src_start + size as usize;
+			let dest_addr = dest_offset + exec.data_addr();
+			println!("{source:?}@{src_offset:x} => {:x}..{:x}", dest_addr,dest_addr+size); 
 			data_section[dest_start..dest_end].copy_from_slice(
 				&self.source_data[source.0 as usize][src_start..src_end]
 			);
 		});
+		
+		println!("{:?}", data_section);
 		
 		exec.set_data(data_section);
 		
@@ -1177,8 +1182,11 @@ impl<'a> Linker<'a> {
 				self.apply_relocation(&mut exec, &offset_map, rel)?;
 			}
 		}
+		println!("{:?}", exec.data);
 
-		exec.write(out)
+		// this should never panic, since we did require_range on the entry point.
+		let entry_addr = offset_map.translate_offset(entry_source, entry_offset).unwrap() + exec.data_addr();
+		exec.write(out, entry_addr)
 	}
 
 	/// Easy linking API. Just provide a path and the name of the entry function.
