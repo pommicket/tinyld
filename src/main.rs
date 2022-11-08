@@ -5,6 +5,8 @@
 
 extern crate clap;
 
+use std::io;
+use io::Write;
 use clap::Parser;
 
 #[cfg(target_endian = "big")]
@@ -52,6 +54,9 @@ struct Args {
 	/// C++ compiler flags
 	#[arg(long = "cxxflags", default_values = linker::Linker::DEFAULT_CXXFLAGS)]
 	cxxflags: Vec<String>,
+	/// verbose mode
+	#[arg(short = 'v', long = "verbose")]
+	verbose: bool,
 }
 
 fn main_() -> Result<(), String> {
@@ -96,10 +101,26 @@ fn main_() -> Result<(), String> {
 	}
 
 	for input in inputs.iter() {
+		if args.verbose {
+			println!("processing source file {input}...");
+		}
 		linker.add_input(input)?;
 	}
 
-	linker.link_to_file(&args.output, &args.entry)
+	if args.verbose {
+		print!("linking {}... ", args.output);
+	}
+	
+	io::stdout().flush().unwrap_or(());
+	let info = linker.link_to_file(&args.output, &args.entry)?;
+	
+	if args.verbose {
+		println!("\x1b[92msuccess!\x1b[0m");
+		println!("data size:      {:7} bytes", info.data_size);
+		println!("executable size:{:7} bytes", info.exec_size);
+	}
+	
+	Ok(())
 }
 
 fn main() {

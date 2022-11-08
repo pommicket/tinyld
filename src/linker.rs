@@ -55,6 +55,14 @@ std::ofstream cout("/dev/stdout");
 std::ifstream cin("/dev/stdin");
 ```
 or use `printf`, `scanf` for smaller executables.
+
+Notes on executable size:
+
+- A bare minimum executable with libc is ~300 bytes, and
+  without libc is ~100 bytes.
+- Each external symbol requires 21 + 8n + l bytes in total,
+  where l is the length of the name, and n is the number of times
+  it is used. It (thankfully) doesn't seem to be worth it to use `dlsym`.
 */
 
 use crate::elf;
@@ -711,7 +719,7 @@ impl LinkerOutput {
 	}
 
 	/// output the executable.
-	pub fn write(&self, mut out: impl Write + Seek, entry_point: u64) -> LinkResult<()> {
+	pub fn write(&self, mut out: impl Write + Seek, entry_point: u64) -> LinkResult<LinkInfo> {
 		let u64_to_u32 = LinkError::u64_to_u32;
 		let usize_to_u32 = LinkError::usize_to_u32;
 
@@ -882,9 +890,19 @@ impl LinkerOutput {
 			};
 			out.write_all(&phdr_dynamic.to_bytes())?;
 		}
-
-		Ok(())
+		
+		out.seek(io::SeekFrom::End(0))?;
+		Ok(LinkInfo {
+			data_size: self.data.len() as u64,
+			exec_size: out.stream_position()?
+		})
 	}
+}
+
+/// info about linked executable
+pub struct LinkInfo {
+	pub exec_size: u64,
+	pub data_size: u64,
 }
 
 impl<'a> Linker<'a> {
@@ -1257,7 +1275,7 @@ impl<'a> Linker<'a> {
 	}
 
 	/// Link everything together.
-	pub fn link(&self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
+	pub fn link(&self, out: impl Write + Seek, entry: &str) -> LinkResult<LinkInfo> {
 		let mut exec = LinkerOutput::new(0x400000);
 		if self.bss_size > 0 {
 			exec.set_bss(0x70000000, self.bss_size);
@@ -1331,7 +1349,7 @@ impl<'a> Linker<'a> {
 	/// Instead, define `void <main/entry/something_else>(void)`, and make sure you call `exit`,
 	/// or do an exit system interrupt at the end of the function --- if you just return,
 	/// you'll get a segmentation fault.
-	pub fn link_to_file(&self, path: impl AsRef<path::Path>, entry: &str) -> Result<(), String> {
+	pub fn link_to_file(&self, path: impl AsRef<path::Path>, entry: &str) -> Result<LinkInfo, String> {
 		let path = path.as_ref();
 		let mut out_options = fs::OpenOptions::new();
 		out_options.write(true).create(true).truncate(true);
