@@ -1,6 +1,5 @@
 /*
 @TODO:
-- generate a warning/error on position-independent object files
 - static libraries
 */
 

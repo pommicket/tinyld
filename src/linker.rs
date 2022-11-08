@@ -120,18 +120,21 @@ pub enum LinkWarning {
 	/// unsupported relocation type
 	RelUnsupported(u8),
 	/// relocation is too large
-	RelOOB(String, u64),
+	RelOob(String, u64),
 	/// multiple definitions of a symbol
 	MultipleDefinitions(String),
+	/// looks like a position-independent file.
+	MaybePic(String),
 }
 
 impl fmt::Display for LinkWarning {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		use LinkWarning::*;
 		match self {
-			RelOOB(source, offset) => write!(f, "relocation {source}+0x{offset:x} goes outside of its section (it will be ignored)."),
+			RelOob(source, offset) => write!(f, "relocation {source}+0x{offset:x} goes outside of its section (it will be ignored)."),
 			RelUnsupported(x) => write!(f, "Unsupported relocation type {x} (relocation ignored)."),
 			MultipleDefinitions(name) => write!(f, "Symbol {name} has multiple definitions. One of them will be chosen arbitrarily."),
+			MaybePic(name) => write!(f, "{name} looks like a position-independent object. Try recompiling with -fno-pic?"),
 		}
 	}
 }
@@ -956,6 +959,10 @@ impl<'a> Linker<'a> {
 		symbol: &elf::Symbol,
 	) -> ObjectResult<()> {
 		let name = elf.symbol_name(symbol)?;
+		if name == "_GLOBAL_OFFSET_TABLE_" {
+			self.emit_warning(LinkWarning::MaybePic(self.source_name(source).into()));
+		}
+		
 		let name_id = self.symbol_names.add(name);
 		let size = symbol.size;
 
@@ -1005,6 +1012,7 @@ impl<'a> Linker<'a> {
 		use ObjectError::*;
 
 		let source_id = SourceId(self.sources.len() as _);
+		self.sources.push(name.into());
 
 		let elf = elf::Reader32LE::new(reader)?;
 		if elf.r#type() != elf::Type::Rel {
@@ -1033,7 +1041,6 @@ impl<'a> Linker<'a> {
 		}
 
 		self.relocations.push(relocations);
-		self.sources.push(name.into());
 		self.source_data.push(elf.to_data());
 
 		Ok(())
@@ -1162,7 +1169,7 @@ impl<'a> Linker<'a> {
 	/// Apply relocation to executable.
 	fn apply_relocation(&self, exec: &mut LinkerOutput, map: &OffsetMap, rel: &Relocation) {
 		let warn_oob = || {
-			self.emit_warning(LinkWarning::RelOOB(
+			self.emit_warning(LinkWarning::RelOob(
 				self.source_name(rel.r#where.0).into(),
 				rel.r#where.1,
 			));
