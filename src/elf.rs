@@ -421,14 +421,14 @@ impl RelType {
 		}
 	}
 
-	pub fn to_x86_u8(self) -> Option<u8> {
+	pub fn to_x86_u8(self) -> u8 {
 		use RelType::*;
-		Some(match self {
+		match self {
 			Direct32 => 1,
 			Pc32 => 2,
 			Other(x) => x,
-		})
-	}
+		}
+	}	
 }
 
 pub struct Relocation {

@@ -1,6 +1,7 @@
 /*
 @TODO:
-- get rid of RelNoSym + RelOOB
+- "@TODO : else?"
+- get rid of RelNoSym if not needed
 - ObjectResult
 - what happens when a symbol has two definitions? can this happen with multiple c++ files which use the same template?
 - disable "warning: relocation XXX not in a data/text section" for .rel.eh_frame + maybe others

@@ -7,7 +7,8 @@ all initialized data will be executable. All code will be writable.
 You shouldn't use this unless all you want is a tiny little executable file.
 
 Currently, only 32-bit ELF is supported.
-If you are using C, you will need `gcc-multilib` for the 32-bit headers.
+If you are using C/C++, you will need `gcc-multilib` for the 32-bit headers.
+If you're using C++, you'll need `g++-multilib` too.
 
 Position-independent code is NOT supported, and makes executables
 larger anyways. Make sure you compile with `-fno-pic` or equivalent.
@@ -89,7 +90,7 @@ impl From<&LinkError> for String {
 pub enum LinkWarning {
 	/// unsupported relocation type
 	RelUnsupported(u8),
-	/// relocation is too large to fit inside its symbol
+	/// relocation is too large
 	RelOOB(String, u64),
 	/// relocation does not take place in a symbol's data
 	RelNoSym(String, u64),
@@ -99,7 +100,7 @@ impl fmt::Display for LinkWarning {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		use LinkWarning::*;
 		match self {
-			RelOOB(text, offset) => write!(f, "relocation applied to {text}+0x{offset:x}, which goes outside of the symbol (it will be ignored)."),
+			RelOOB(source, offset) => write!(f, "relocation {source}+0x{offset:x} goes outside of its section (it will be ignored)."),
 			RelNoSym(source, offset) => write!(
 				f,
 				"relocation {source}+0x{offset:x} not in a data/text section. it will be ignored."
@@ -320,6 +321,10 @@ struct Relocation {
 	/// type of `sym`
 	symbol_type: elf::SymbolType,
 	addend: i64,
+	/// relocation metadata offset (for debugging)
+	#[cfg(debug_assertions)]
+	#[allow(unused)]
+	entry_offset: u64,
 }
 
 pub struct Linker<'a> {
@@ -605,11 +610,12 @@ impl LinkerOutput {
 		use SymbolValue::*;
 		match value {
 			Data { source, offset, .. } => {
-				// in theory, this should never panic, because we compute OffsetMap
-				// to include all dependent symbols.
-				map.translate_offset(*source, *offset)
-					.unwrap()
-					+ self.data_addr()
+				match map.translate_offset(*source, *offset) {
+					// in theory, this should only be None when we emitted a warning
+					// about a fucked up relocation
+					None => return 0,
+					Some(o) => o + self.data_addr(),
+				}
 			}
 			Bss(x) => {
 				// this shouldn't panic, since we always generate a bss section
@@ -670,7 +676,7 @@ impl LinkerOutput {
 				let index = *symbols.get(&reloc.sym).unwrap();
 				let rel = elf::Rel32 {
 					offset: u64_to_u32(*addr)?,
-					info: index << 8 | u32::from(reloc.r#type.to_x86_u8().unwrap()),
+					info: index << 8 | u32::from(reloc.r#type.to_x86_u8()),
 				};
 				out.write_all(&rel.to_bytes())?;
 			}
@@ -922,6 +928,8 @@ impl<'a> Linker<'a> {
 				symbol_type: rel.symbol.r#type,
 				r#type: rel.r#type,
 				addend: rel.addend,
+				#[cfg(debug_assertions)]
+				entry_offset: rel.entry_offset,
 			});
 		}
 		
@@ -1048,6 +1056,30 @@ impl<'a> Linker<'a> {
 		exec.eval_symbol_value(map, &info.value)
 	}
 
+	fn source_name(&self, id: SourceId) -> &str {
+		&self.sources[id.0 as usize]
+	}
+
+	/// The value of the relocation *before* taking its type into account.
+	/// This is used to determine the actual value of the relocation, as well as
+	/// for figuring out what data a relocation "depends on".
+	fn relocation_absolute_value(&self, rel: &Relocation, symbol_value: u64, current_data: &[u8]) -> Result<u64, LinkWarning> {
+		// currently this only deals with 32-bit relocations
+		if current_data.len() < 4 {
+			return Err(LinkWarning::RelOOB(self.source_name(rel.r#where.0).into(), rel.r#where.1));
+		}
+		
+		let current_val = u32::from_le_bytes([
+			current_data[0],
+			current_data[1],
+			current_data[2],
+			current_data[3],
+		]);
+		
+		
+		Ok(symbol_value.wrapping_add(rel.addend as u64).wrapping_add(current_val.into()))
+	}
+
 	/// Apply relocation to executable.
 	fn apply_relocation(&self, exec: &mut LinkerOutput, map: &OffsetMap, rel: &Relocation) -> LinkResult<()> {
 		let apply_offset = match map.translate_rel_offset(rel) {
@@ -1070,43 +1102,26 @@ impl<'a> Linker<'a> {
 
 		let symbol_value = self.get_symbol_value(map, exec, symbol);
 
-		let addend = rel.addend;
-
-		enum Value {
-			U32(u32),
-		}
-		use elf::RelType::*;
-		use Value::*;
-		
-		let s_plus_a = symbol_value.wrapping_add(addend as u64);
-
-		let value = match rel.r#type {
-			Direct32 => U32(LinkError::u64_to_u32(s_plus_a)?),
-			Pc32 => U32(LinkError::u64_to_u32(s_plus_a - pc)?),
-			Other(x) => {
-				self.emit_warning(LinkWarning::RelUnsupported(x));
-				return Ok(());
-			}
-		};
-
 		// guarantee failure if apply_offset can't be converted to usize.
 		// (this will probably never happen)
 		let apply_start = apply_offset.try_into().unwrap_or(usize::MAX - 1000);
-
-		fn u32_from_le_slice(data: &[u8]) -> u32 {
-			u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+		let data = &mut exec.data[apply_start..];use elf::RelType::*;
+		match self.relocation_absolute_value(rel, symbol_value, data) {
+			Ok(value) => {
+				let (value, size) = match rel.r#type {
+					Direct32 => (value & u64::from(u32::MAX), 4),
+					Pc32 => ((value - pc) & u64::from(u32::MAX), 4),
+					Other(x) => {
+						self.emit_warning(LinkWarning::RelUnsupported(x));
+						return Ok(())
+					},
+				};
+				data[..size].copy_from_slice(&u64::to_le_bytes(value)[..size]);
+			},
+			Err(warning) => {
+				self.emit_warning(warning);
+			},
 		}
-		
-
-		match value {
-			U32(u) => {
-				if let Some(apply_to) = exec.data.get_mut(apply_start..apply_start + 4) {
-					let curr_val = u32_from_le_slice(apply_to);
-					let new_val = u.wrapping_add(curr_val);
-					apply_to.copy_from_slice(&new_val.to_le_bytes());
-				}
-			}
-		};
 
 		Ok(())
 	}
@@ -1114,12 +1129,24 @@ impl<'a> Linker<'a> {
 
 	fn require_range(&self, ranges: &mut RangeSet, source: SourceId, offset: u64, size: u64) {
 		if ranges.add(source, offset, size) {
-			for (_, rel) in self.relocations[source.0 as usize].range(offset..offset + size) {
-				if let Some(symbol) = self.get_symbol_id(rel.r#where.0, rel.sym) {
+			let src_idx = usize::try_from(source.0).unwrap();
+			for (_, rel) in self.relocations[src_idx].range(offset..offset + size) {
+				let (source, off) = rel.r#where;
+				if let Some(symbol) = self.get_symbol_id(source, rel.sym) {
 					let value = &self.symbols.get_info_from_id(symbol).value;
-					if let SymbolValue::Data { source: req_source, offset: req_offset, size: req_size } = value {
-						// @TODO: check addend
-						self.require_range(ranges, *req_source, *req_offset, *req_size)
+					if let &SymbolValue::Data { source: req_source, offset: req_offset, size: req_size } = value {
+						self.require_range(ranges, req_source, req_offset, req_size);
+// 						let off_idx = usize::try_from(off).unwrap_or(usize::MAX);
+// 						let curr_value = self.source_data[src_idx].get(off_idx..).unwrap_or(&[]);
+// 						if let Ok(range_start) = self.relocation_absolute_value(rel, req_offset, curr_value) {
+// 							let range_end = req_offset + req_size;
+// 							if range_end < range_start {
+// 								// @TODO: emit warning
+// 								println!("{:x}",off);
+// 								continue;
+// 							}
+// 							self.require_range(ranges, req_source, range_start, range_end - range_start);
+// 						} // else, we'll emit a warning in apply_relocation
 					} // else, it's okay, it's a bss relocation or something hopefully
 				} // else, we'll deal with it in apply_relocation
 			}

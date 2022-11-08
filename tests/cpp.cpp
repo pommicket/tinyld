@@ -3,8 +3,20 @@
 #include <algorithm>
 #include <climits>
 
-extern "C" int main(void) {
+extern "C" int main() {
 	std::vector<int> numbers = {};
 	
-	exit((int)(long)&numbers);
+	while (1) {
+		int n = INT_MIN;
+		std::cin >> n;
+		if (n == INT_MIN) break;
+		numbers.push_back(n);
+	}
+	
+	//std::sort(numbers.begin(), numbers.end());
+	
+	for (int n: numbers)
+		std::cout << n << std::endl;
+	
+	exit(0);
 }
