@@ -571,7 +571,8 @@ impl OffsetMap {
 
 /// info about the final executable file.
 struct LinkerOutput {
-	interp: Vec<u8>,
+	/// ELF interpreter
+	interp: String,
 	/// virtual address of big ol' section containing data + elf header + etc.
 	load_addr: u64,
 	/// .bss section address and size if there is one.
@@ -598,7 +599,7 @@ impl LinkerOutput {
 			bss: None,
 			load_addr,
 			data: vec![],
-			interp: vec![],
+			interp: String::new(),
 			relocations: vec![],
 			lib_strtab_offsets: vec![],
 			dynsyms: HashMap::new(),
@@ -613,8 +614,7 @@ impl LinkerOutput {
 
 	/// set the ELF interpreter (typically `/lib/ld-linux.so.2`)
 	pub fn set_interp(&mut self, interp: &str) {
-		self.interp = interp.as_bytes().into();
-		self.interp.push(b'\0');
+		self.interp = interp.into();
 	}
 
 	/// returns offset into strtab
@@ -657,7 +657,8 @@ impl LinkerOutput {
 
 	/// offset of program headers
 	fn ph_offset(&self) -> u64 {
-		elf::Ehdr32::size_of().into()
+		// - 4 because we overwrite shnum, shstrndx
+		u64::from(elf::Ehdr32::size_of()) - 4
 	}
 
 	/// size of program headers
@@ -728,11 +729,25 @@ impl LinkerOutput {
 		if !self.interp.is_empty() {
 			// now interp
 			interp_offset = stream_position32(&mut out)?;
-			out.write_all(&self.interp)?;
-			interp_size = usize_to_u32(self.interp.len())?;
+			// NOTE: we don't need a null terminator, since
+			// this section is immediately followed by strtab
+			out.write_all(self.interp.as_bytes())?;
+			interp_size = usize_to_u32(self.interp.len() + 1)?;
 			// now strtab
 			let strtab_offset = stream_position32(&mut out)?;
 			out.write_all(&self.strtab)?;
+			// now hash
+			let hashtab_offset = stream_position32(&mut out)?;
+			// put everything in a single bucket
+			let nsymbols = usize_to_u32(self.dynsyms.len())?;
+			out.write_all(&u32::to_le_bytes(1))?; // nbucket
+			out.write_all(&u32::to_le_bytes(nsymbols + 1))?; // nchain
+			out.write_all(&u32::to_le_bytes(0))?; // bucket begins at 0
+									  // chain 1 -> 2 -> 3 -> ... -> n -> 0
+			for i in 1..nsymbols {
+				out.write_all(&u32::to_le_bytes(i))?;
+			}
+			// (note : we need two more 0 entries, and those are provided just below by null_symbol)
 			// now symtab
 			let symtab_offset = stream_position32(&mut out)?;
 			let null_symbol = [0; mem::size_of::<elf::Sym32>()];
@@ -761,28 +776,11 @@ impl LinkerOutput {
 				out.write_all(&rel.to_bytes())?;
 			}
 			let reltab_size = stream_position32(&mut out)? - reltab_offset;
-			// now hash
-			let hashtab_offset = stream_position32(&mut out)?;
-			// put everything in a single bucket
-			let nsymbols = u64_to_u32(symbols.len() as u64)?;
-			out.write_all(&u32::to_le_bytes(1))?; // nbucket
-			out.write_all(&u32::to_le_bytes(nsymbols + 1))?; // nchain
-			out.write_all(&u32::to_le_bytes(0))?; // bucket begins at 0
-									  // chain 1 -> 2 -> 3 -> ... -> n -> 0
-			for i in 1..nsymbols {
-				out.write_all(&u32::to_le_bytes(i))?;
-			}
-			out.write_all(&u32::to_le_bytes(0))?;
-			// i don't know why this needs to be here.
-			out.write_all(&u32::to_le_bytes(0))?;
-
 			// now dyntab
 			dyntab_offset = stream_position32(&mut out)?;
 			let mut dyn_data = vec![
 				elf::DT_RELSZ,
 				reltab_size,
-				elf::DT_RELENT,
-				8,
 				elf::DT_REL,
 				load_addr + reltab_offset,
 				elf::DT_STRSZ,
@@ -799,13 +797,18 @@ impl LinkerOutput {
 			for lib in &self.lib_strtab_offsets {
 				dyn_data.extend([elf::DT_NEEDED, u64_to_u32(*lib)?]);
 			}
-			dyn_data.extend([elf::DT_NULL, 0]);
+			dyn_data.push(elf::DT_RELENT);
 			let mut dyn_bytes = Vec::with_capacity(dyn_data.len() * 4);
 			for x in dyn_data {
 				dyn_bytes.extend(u32::to_le_bytes(x));
 			}
 			dyntab_size = usize_to_u32(dyn_bytes.len())?;
 			out.write_all(&dyn_bytes)?;
+
+			// dyn_data should have been extended with [8 (value of DT_RELENT), 0, 0 (terminal record)]
+			// however, we don't need to include all those zero bytes, because we're at the end of the file.
+			// we just need one 8-byte:
+			out.write_all(&[8])?;
 		}
 
 		let file_size: u32 = stream_position32(&mut out)?;
@@ -814,14 +817,17 @@ impl LinkerOutput {
 
 		let ehdr = elf::Ehdr32 {
 			phnum: self.segment_count(),
-			phoff: elf::Ehdr32::size_of().into(),
-			// apparently you're supposed to set this to zero if there are no sections.
-			// at least, that's what readelf seems to think.
+			phoff: u64_to_u32(self.ph_offset())?,
+			// by setting shentsize to 0, we ensure that
+			// linux will ignore the sections,
+			// even if shnum != 0
 			shentsize: 0,
 			entry: u64_to_u32(entry_point)?,
 			..Default::default()
 		};
 		out.write_all(&ehdr.to_bytes())?;
+		// go back to overwrite shnum, shstrndx
+		out.seek(io::SeekFrom::Current(-4))?;
 
 		let phdr_data = elf::Phdr32 {
 			flags: elf::PF_R | elf::PF_W | elf::PF_X, // read, write, execute
@@ -879,8 +885,15 @@ impl LinkerOutput {
 }
 
 impl<'a> Linker<'a> {
-	pub const DEFAULT_CFLAGS: [&str; 5] = ["-Wall", "-Os", "-m32", "-fno-pic", "-c"];
-	pub const DEFAULT_CXXFLAGS: [&str; 5] = Self::DEFAULT_CFLAGS;
+	pub const DEFAULT_CFLAGS: [&str; 6] = [
+		"-Wall",
+		"-Os",
+		"-fomit-frame-pointer",
+		"-m32",
+		"-fno-pic",
+		"-c",
+	];
+	pub const DEFAULT_CXXFLAGS: [&str; 6] = Self::DEFAULT_CFLAGS;
 
 	fn default_warning_handler(warning: LinkWarning) {
 		eprintln!("warning: {warning}");

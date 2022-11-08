@@ -22,7 +22,6 @@ pub const PF_X: u32 = 1 << 0;
 pub const PF_W: u32 = 1 << 1;
 pub const PF_R: u32 = 1 << 2;
 
-pub const DT_NULL: u32 = 0;
 pub const DT_NEEDED: u32 = 1;
 pub const DT_HASH: u32 = 4;
 pub const DT_STRTAB: u32 = 5;

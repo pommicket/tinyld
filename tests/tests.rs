@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests {
-	use std::process::{Command, Output};
 	use std::fs::File;
-	use tinyld::linker::{Linker, LinkWarning};
-	
+	use std::process::{Command, Output};
+	use tinyld::linker::{LinkWarning, Linker};
+
 	fn panic_warning_handler(warning: LinkWarning) {
 		eprintln!("warning: {warning}");
 		panic!("this should not generate a warning");
@@ -14,7 +14,7 @@ mod tests {
 		linker.set_warning_handler(panic_warning_handler);
 		linker
 	}
-	
+
 	fn file(s: &str) -> String {
 		format!("./tests/{s}")
 	}
@@ -24,30 +24,30 @@ mod tests {
 		let s = if is_local { &f } else { src };
 		linker.add_input(s).expect(&format!("failed to add {s}"));
 	}
-	
+
 	fn link(linker: &Linker, out: &str, entry: &str) {
-		linker.link_to_file(&file(out), entry).expect("failed to link");
+		linker
+			.link_to_file(&file(out), entry)
+			.expect("failed to link");
 	}
-	
+
 	fn run_with_stdin(name: &str, stdin: Option<&str>) -> Output {
 		let mut command = Command::new(&file(name));
 		if let Some(s) = stdin {
 			let file = File::open(&file(s)).expect("stdin file does not exist");
 			command.stdin(file);
 		}
-		
-		let output = command
-			.output()
-			.expect("failed to run output executable");
+
+		let output = command.output().expect("failed to run output executable");
 		assert!(output.status.success());
 		assert!(output.stderr.is_empty());
 		output
 	}
-		
+
 	fn run(name: &str) -> std::process::Output {
 		run_with_stdin(name, None)
 	}
-	
+
 	#[test]
 	fn tiny_c() {
 		let mut linker = test_linker();
@@ -66,16 +66,22 @@ mod tests {
 		let output = run("basic.out");
 		assert_eq!(output.stdout, b"137\n");
 	}
-	
+
 	#[test]
 	fn dylib_c() {
 		let status = Command::new("gcc")
-			.args(&["-m32", "-fPIC", "-shared", &file("dylib.c"), "-o", &file("dylib.so")])
+			.args(&[
+				"-m32",
+				"-fPIC",
+				"-shared",
+				&file("dylib.c"),
+				"-o",
+				&file("dylib.so"),
+			])
 			.status()
 			.expect("failed to create dylib.so");
 		assert!(status.success());
-		
-		
+
 		let mut linker = test_linker();
 		add(&mut linker, "dylib-test.c", true);
 		add(&mut linker, "dylib.so", true);
@@ -84,7 +90,7 @@ mod tests {
 		let output = run("dylib-test.out");
 		assert_eq!(output.stdout, b"7\n8\n");
 	}
-	
+
 	#[test]
 	fn cpp() {
 		let mut linker = test_linker();

@@ -1,6 +1,5 @@
 /*
 @TODO:
-- make executables more tiny (overlap sections, etc.)
 - generate a warning/error on position-independent object files
 - static libraries
 */
