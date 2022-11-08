@@ -3,8 +3,9 @@
 
 int my_number;
 void entry() {
-	my_number = 137;
-	printf("%d\n",my_number);
+	volatile int *p = &my_number;
+	*p = 137;
+	printf("%d\n",*p);
 	exit(0);
 	    
 }

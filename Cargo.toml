@@ -3,6 +3,9 @@ name = "tinyld"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+doctest = false
+
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
 termcolor = "1.1"

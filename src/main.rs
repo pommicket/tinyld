@@ -1,6 +1,5 @@
 /*
 @TODO:
-- automated tests
 - what happens when a symbol has two definitions? can this happen with multiple c++ files which use the same template?
 - disable "warning: relocation XXX not in a data/text section" for .rel.eh_frame + maybe others
 	- these warnings are being generated in two places. do they need to be?
@@ -16,8 +15,7 @@ use clap::Parser;
 #[cfg(target_endian = "big")]
 compile_error! {"WHY do you have a big endian machine???? it's the 21st century, buddy. this program won't work fuck you"}
 
-mod elf;
-pub mod linker;
+use tinyld::linker;
 
 #[derive(Parser, Debug)]
 struct Args {

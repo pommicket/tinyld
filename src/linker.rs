@@ -13,7 +13,7 @@ Position-independent code is NOT supported, and makes executables
 larger anyways. Make sure you compile with `-fno-pic` or equivalent.
 
 Example usage:
-```
+```ignore
 let mut linker = Linker::new();
 linker.add_input("main.o")?;
 linker.add_input("libc.so.6")?;
@@ -50,7 +50,7 @@ This ensures that all destructors are called for local objects in main.
 - If you want a small executable, it's best not to use the STL.
 - For some reason, `std::cout` and `std::cin` don't work. If you can figure out why, please let me know.
   You can get around this with something like
-```
+```cpp
 std::ofstream cout("/dev/stdout");
 std::ifstream cin("/dev/stdin");
 ```
