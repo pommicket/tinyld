@@ -387,11 +387,27 @@ pub struct Linker<'a> {
 	warn: Box<dyn Fn(LinkWarning) + 'a>,
 }
 
+/// Keeps track of which ranges of data in a source need to be outputted in the executable,
+/// and the data offsets in the final executable.
+///
+/// Symbols can overlap, e.g.:
+/// ```c
+/// int f(int x) { return x * x; }
+/// int g(int x) { return 4 * x * x; }
+/// ```
+/// Might get optimized to something like:
+/// ```asm
+/// g: shl edi, 1
+/// f: mov eax, edi
+///    imul eax, eax
+///    ret
+/// ```
+/// So it's slightly complicated to figure out which ranges are needed.
 #[derive(Clone)]
 struct SourceRanges {
-	/// keys are (offset, size).
+	/// Keys are (offset, size). Values are offsets into the final executable's data section.
 	/// INVARIANT: ranges are disjoint, and
-	/// non-adjacent (e.g. [5,10) + [10, 12) should be combined to [5, 12))
+	/// non-adjacent (e.g. 5..10 + 10..12 should be combined to 5..12)
 	map: BTreeMap<(u64, u64), u64>,
 }
 
@@ -400,6 +416,9 @@ impl SourceRanges {
 		Self { map: BTreeMap::new() }
 	}
 	
+	/// Add the range `start..start+size`.
+	/// 
+	/// Returns false if this range was already fully included.
 	fn add(&mut self, start: u64, size: u64) -> bool {
 		let mut l = start;
 		let mut r = start + size;
@@ -441,6 +460,7 @@ impl SourceRanges {
 		true
 	}
 	
+	/// Where should the given source offset map to in the final executable's data section?
 	fn translate_offset(&self, offset: u64) -> Option<u64> {
 		let (range, &out) = self.map.range(..=(offset, u64::MAX)).last()?;
 		if offset >= range.0 && offset < range.0 + range.1 {
@@ -450,6 +470,9 @@ impl SourceRanges {
 		}
 	}
 	
+	/// Set output data offsets.
+	///
+	/// `*size` is the size of the data section so far.
 	fn set_output_offsets(&mut self, size: &mut u64) {
 		for (range, value) in self.map.iter_mut() {
 			// we should only call this function once
@@ -461,7 +484,7 @@ impl SourceRanges {
 	}
 }
 
-// @TODO: doc
+/// Keeps track of which source ranges are needed.
 struct RangeSet {
 	/// `ranges[i]` = ranges for source #`i`.
 	ranges: Vec<SourceRanges>,
@@ -472,11 +495,19 @@ impl RangeSet {
 		Self { ranges: vec![SourceRanges::new(); source_count] }
 	}
 	
-	/// Returns true if the range is not redundant with the current ranges.
+	/// Add the range `start..start+size` in `source`.
+	///
+	/// Returns false if this range was already fully included.
 	fn add(&mut self, source: SourceId, start: u64, size: u64) -> bool {
 		self.ranges[source.0 as usize].add(start, size)
 	}
 	
+	/// Figure out output data offsets.
+	///
+	/// This needs to be called *after* adding all the ranges,
+	/// since later ranges might affect the optimal address
+	/// of earlier ranges, e.g. if `g` was added after `f` in the
+	/// example [here](SourceRanges).
 	fn to_map(mut self) -> OffsetMap {
 		let mut size = 0u64;
 		for range in self.ranges.iter_mut() {
@@ -489,13 +520,15 @@ impl RangeSet {
 	}
 }
 
-// @TODO: doc
+/// Keeps track of where offsets in source files map to in the
+/// final executable's data section.
 struct OffsetMap {
 	size: u64,
 	ranges: Vec<SourceRanges>,
 }
 
 impl OffsetMap {
+	/// get offset in data section corresponding to source offset.
 	fn translate_offset(&self, src: SourceId, offset: u64) -> Option<u64> {
 		self.ranges[src.0 as usize].translate_offset(offset)
 	}
@@ -505,10 +538,16 @@ impl OffsetMap {
 		self.translate_offset(rel.r#where.0, rel.r#where.1)
 	}
 	
+	/// total size of data section
 	fn size(&self) -> u64 {
 		self.size
 	}
 	
+	/// Call `f` for each data range with parameters
+	/// `(source, source_offset, size, dest_offset)`.
+	/// (this indicates `source_offset..source_offset+size` in `source`
+	/// should be mapped to `dest_offset..dest_offset+size` in the final
+	/// executable's data section.)
 	fn for_each(&self, mut f: impl FnMut(SourceId, u64, u64, u64)) {
 		for (src, ranges) in self.ranges.iter().enumerate() {
 			let src_id = SourceId(src.try_into().unwrap());
@@ -519,6 +558,7 @@ impl OffsetMap {
 	}
 }
 
+/// info about the final executable file.
 struct LinkerOutput {
 	interp: Vec<u8>,
 	/// virtual address of big ol' section containing data + elf header + etc.
@@ -1090,32 +1130,17 @@ impl<'a> Linker<'a> {
 		&self.sources[id.0 as usize]
 	}
 
-	// @TODO: move me back into apply_relocation
-	/// The value of the relocation *before* taking its type into account.
-	fn relocation_absolute_value(&self, rel: &Relocation, symbol_value: u64, current_data: &[u8]) -> Result<u64, LinkWarning> {
-		// currently this only deals with 32-bit relocations
-		if current_data.len() < 4 {
-			return Err(LinkWarning::RelOOB(self.source_name(rel.r#where.0).into(), rel.r#where.1));
-		}
-		
-		let current_val = u32::from_le_bytes([
-			current_data[0],
-			current_data[1],
-			current_data[2],
-			current_data[3],
-		]);
-		
-		
-		Ok(symbol_value.wrapping_add(rel.addend as u64).wrapping_add(current_val.into()))
-	}
 
 	/// Apply relocation to executable.
-	fn apply_relocation(&self, exec: &mut LinkerOutput, map: &OffsetMap, rel: &Relocation) -> LinkResult<()> {
+	fn apply_relocation(&self, exec: &mut LinkerOutput, map: &OffsetMap, rel: &Relocation) {
+		let warn_oob = || {
+			self.emit_warning(LinkWarning::RelOOB(self.source_name(rel.r#where.0).into(), rel.r#where.1));
+		};
 		let apply_offset = match map.translate_rel_offset(rel) {
 			Some(data_offset) => data_offset,
 			None => {
 				// this relocation isn't in a data section so there's nothing we can do about it
-				return Ok(());
+				return;
 			}
 		};
 		let pc = apply_offset + exec.data_addr();
@@ -1124,35 +1149,51 @@ impl<'a> Linker<'a> {
 			None => {
 				// symbol not defined. it should come from a library.
 				exec.add_relocation(&self.symbol_names, rel, exec.data_addr() + apply_offset);
-				return Ok(());
+				return;
 			}
 			Some(sym) => sym,
 		};
 
 		let symbol_value = self.get_symbol_value(map, exec, symbol);
-
+		
 		// guarantee failure if apply_offset can't be converted to usize.
 		// (this will probably never happen)
 		let apply_start = apply_offset.try_into().unwrap_or(usize::MAX - 1000);
-		let data = &mut exec.data[apply_start..];use elf::RelType::*;
-		match self.relocation_absolute_value(rel, symbol_value, data) {
-			Ok(value) => {
-				let (value, size) = match rel.r#type {
-					Direct32 => (value & u64::from(u32::MAX), 4),
-					Pc32 => (value.wrapping_sub(pc) & u64::from(u32::MAX), 4),
-					Other(x) => {
-						self.emit_warning(LinkWarning::RelUnsupported(x));
-						return Ok(())
-					},
-				};
-				data[..size].copy_from_slice(&u64::to_le_bytes(value)[..size]);
-			},
-			Err(warning) => {
-				self.emit_warning(warning);
-			},
+		if apply_start >= exec.data.len() {
+			warn_oob();
+			return;
 		}
-
-		Ok(())
+		let data = &mut exec.data[apply_start..];
+		
+		let current_val = u64::from_le_bytes([
+			data.get(0).copied().unwrap_or(0),
+			data.get(1).copied().unwrap_or(0),
+			data.get(2).copied().unwrap_or(0),
+			data.get(3).copied().unwrap_or(0),
+			data.get(4).copied().unwrap_or(0),
+			data.get(5).copied().unwrap_or(0),
+			data.get(6).copied().unwrap_or(0),
+			data.get(7).copied().unwrap_or(0),
+		]);
+		
+		// value of relocation not taking rel.r#type into account.
+		let base_value = symbol_value.wrapping_add(rel.addend as u64).wrapping_add(current_val.into());
+		
+		use elf::RelType::*;
+		let (value, size) = match rel.r#type {
+			Direct32 => (base_value & u64::from(u32::MAX), 4),
+			Pc32 => (base_value.wrapping_sub(pc) & u64::from(u32::MAX), 4),
+			Other(x) => {
+				self.emit_warning(LinkWarning::RelUnsupported(x));
+				return;
+			},
+		};
+		
+		if data.len() < size {
+			warn_oob();
+			return;
+		}
+		data[..size].copy_from_slice(&u64::to_le_bytes(value)[..size]);
 	}
 
 
@@ -1165,19 +1206,6 @@ impl<'a> Linker<'a> {
 					let value = &self.symbols.get_info_from_id(symbol).value;
 					if let &SymbolValue::Data { source: req_source, offset: req_offset, size: req_size } = value {
 						self.require_range(ranges, req_source, req_offset, req_size);
-						
-						// @TODO: delete
-// 						let off_idx = usize::try_from(off).unwrap_or(usize::MAX);
-// 						let curr_value = self.source_data[src_idx].get(off_idx..).unwrap_or(&[]);
-// 						if let Ok(range_start) = self.relocation_absolute_value(rel, req_offset, curr_value) {
-// 							let range_end = req_offset + req_size;
-// 							if range_end < range_start {
-// 								// @TODO: emit warning
-// 								println!("{:x}",off);
-// 								continue;
-// 							}
-// 							self.require_range(ranges, req_source, range_start, range_end - range_start);
-// 						} // else, we'll emit a warning in apply_relocation
 					} // else, it's okay, it's a bss relocation or something hopefully
 				} // else, we'll deal with it in apply_relocation
 			}
@@ -1237,7 +1265,7 @@ impl<'a> Linker<'a> {
 		
 		for rel_map in self.relocations.iter() {
 			for rel in rel_map.values() {
-				self.apply_relocation(&mut exec, &offset_map, rel)?;
+				self.apply_relocation(&mut exec, &offset_map, rel);
 			}
 		}
 
