@@ -1,11 +1,9 @@
 /*
 @TODO:
 - automated tests
-- get rid of RelNoSym if not needed
-- ObjectResult
 - what happens when a symbol has two definitions? can this happen with multiple c++ files which use the same template?
 - disable "warning: relocation XXX not in a data/text section" for .rel.eh_frame + maybe others
-    - these warnings are being generated in two places. do they need to be?
+	- these warnings are being generated in two places. do they need to be?
 - make executables more tiny (overlap sections, etc.)
 - generate a warning/error on position-independent object files
 - static libraries
@@ -74,7 +72,7 @@ fn main_() -> Result<(), String> {
 	let inputs = &args.inputs;
 
 	let mut linker = linker::Linker::new();
-	
+
 	linker.set_cc(&args.cc);
 	linker.set_cflags(&args.cflags);
 	linker.set_cxx(&args.cxx);

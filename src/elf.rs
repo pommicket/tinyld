@@ -428,13 +428,13 @@ impl RelType {
 			Pc32 => 2,
 			Other(x) => x,
 		}
-	}	
+	}
 }
 
 pub struct Relocation {
 	pub r#type: RelType,
 	/// file offset of relocation metadata (for debugging)
-	pub entry_offset: u64, 
+	pub entry_offset: u64,
 	/// where the relocation should be applied. for [ET_REL], this is a file offset; otherwise, it's an address.
 	pub offset: u64,
 	/// symbol which should be inserted at the offset.
@@ -488,13 +488,13 @@ impl Reader32LE {
 impl Reader for Reader32LE {
 	fn new(mut reader: impl BufRead + Seek) -> Result<Self> {
 		use Error::*;
-		
+
 		reader.seek(io::SeekFrom::End(0))?;
 		let file_size = reader.stream_position()?;
-		reader.seek(io::SeekFrom::Start(0))?;		
+		reader.seek(io::SeekFrom::Start(0))?;
 		let mut data = vec![0; file_size.try_into().map_err(|_| TooLarge)?];
 		reader.read_exact(&mut data)?;
-		reader.seek(io::SeekFrom::Start(0))?;	
+		reader.seek(io::SeekFrom::Start(0))?;
 
 		let mut hdr_buf = [0; 0x34];
 		reader.read_exact(&mut hdr_buf)?;
@@ -542,12 +542,11 @@ impl Reader for Reader32LE {
 				if name == ".strtab" {
 					strtab_idx = Some(s_idx);
 				}
-				
-				section_names.push(name);
 
+				section_names.push(name);
 			}
 		}
-		
+
 		for shdr in shdrs.iter() {
 			let mut symtab = vec![];
 			if shdr.r#type == SHT_SYMTAB && shdr.entsize as usize >= mem::size_of::<Sym32>() {
@@ -576,11 +575,10 @@ impl Reader for Reader32LE {
 						}
 						x => return Err(BadSymShNdx(x)),
 					};
-					
+
 					let mut name = {
 						let strtab_offset = shdrs[strtab_idx.ok_or(Error::NoStrtab)?].offset;
-						let strtab = &data.get(strtab_offset as usize..)
-							.ok_or(Error::NoStrtab)?;
+						let strtab = &data.get(strtab_offset as usize..).ok_or(Error::NoStrtab)?;
 						let i = sym.name as usize;
 						let mut end = i;
 						while end < strtab.len() && strtab[end] != b'\0' {
@@ -588,16 +586,14 @@ impl Reader for Reader32LE {
 						}
 						bytes_to_string(strtab[i..end].to_vec())?
 					};
-					
-					if name.is_empty() {
-						if r#type == SymbolType::Section {
-							// section symbols have empty names.
-							// this makes sense, since you don't want to repeat the strings in .strtab and .shstrtab
-							// but i don't know why .strtab and .shstrtab are separate....
-							name = section_names[usize::from(sym.shndx)].clone();
-						}
+
+					if name.is_empty() && r#type == SymbolType::Section {
+						// section symbols have empty names.
+						// this makes sense, since you don't want to repeat the strings in .strtab and .shstrtab
+						// but i don't know why .strtab and .shstrtab are separate....
+						name = section_names[usize::from(sym.shndx)].clone();
 					}
-					
+
 					let symbol = Symbol {
 						name,
 						value,

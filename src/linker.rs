@@ -27,8 +27,8 @@ Notes about using C/C++:
   Otherwise you will get a segfault/illegal instruction/etc:
 ```c
 (extern "C") void entry() {
-	...
-	exit(0);
+    ...
+    exit(0);
 }
 ```
 - You will need `gcc-multilib` for the 32-bit headers.
@@ -38,10 +38,10 @@ Notes about using C++:
 - I recommend you do something like this:
 ```c
 extern "C" void entry() {
-	exit(main());
+    exit(main());
 }
 int main() {
-	...
+    ...
 }
 ```
 This ensures that all destructors are called for local objects in main.
@@ -82,12 +82,11 @@ impl LinkError {
 	fn u64_to_u32(u: u64) -> LinkResult<u32> {
 		u.try_into().map_err(|_| LinkError::TooLarge)
 	}
-	
+
 	/// convert `u` to `u32`, returning [LinkError::TooLarge] if it overflows.
 	fn usize_to_u32(u: usize) -> LinkResult<u32> {
 		u.try_into().map_err(|_| LinkError::TooLarge)
 	}
-	
 }
 
 type LinkResult<T> = Result<T, LinkError>;
@@ -122,8 +121,6 @@ pub enum LinkWarning {
 	RelUnsupported(u8),
 	/// relocation is too large
 	RelOOB(String, u64),
-	/// relocation does not take place in a symbol's data
-	RelNoSym(String, u64),
 }
 
 impl fmt::Display for LinkWarning {
@@ -131,10 +128,6 @@ impl fmt::Display for LinkWarning {
 		use LinkWarning::*;
 		match self {
 			RelOOB(source, offset) => write!(f, "relocation {source}+0x{offset:x} goes outside of its section (it will be ignored)."),
-			RelNoSym(source, offset) => write!(
-				f,
-				"relocation {source}+0x{offset:x} not in a data/text section. it will be ignored."
-			),
 			RelUnsupported(x) => write!(f, "Unsupported relocation type {x} (relocation ignored)."),
 		}
 	}
@@ -156,6 +149,8 @@ pub enum ObjectError {
 	/// compile command failed
 	CommandFailed(std::process::ExitStatus),
 }
+
+type ObjectResult<T> = Result<T, ObjectError>;
 
 impl From<io::Error> for ObjectError {
 	fn from(e: io::Error) -> Self {
@@ -255,7 +250,11 @@ enum SymbolValue {
 	/// offset into BSS section
 	Bss(u64),
 	/// this symbol has data in `source` at `offset..offset+size`
-	Data { source: SourceId, offset: u64, size: u64 },
+	Data {
+		source: SourceId,
+		offset: u64,
+		size: u64,
+	},
 	/// An absolute value. This corresponds to relocations with
 	/// `shndx == SHN_ABS`.
 	Absolute(u64),
@@ -293,7 +292,12 @@ impl Symbols {
 	}
 
 	fn add_(&mut self, source: SourceId, name: SymbolName, info: SymbolInfo) -> SymbolId {
-		let id = SymbolId(self.info.len().try_into().expect("too many symbols wtf is wrong with you"));
+		let id = SymbolId(
+			self.info
+				.len()
+				.try_into()
+				.expect("too many symbols wtf is wrong with you"),
+		);
 		self.info.push(info);
 		self.locations.push((source, name));
 		id
@@ -413,16 +417,18 @@ struct SourceRanges {
 
 impl SourceRanges {
 	fn new() -> Self {
-		Self { map: BTreeMap::new() }
+		Self {
+			map: BTreeMap::new(),
+		}
 	}
-	
+
 	/// Add the range `start..start+size`.
-	/// 
+	///
 	/// Returns false if this range was already fully included.
 	fn add(&mut self, start: u64, size: u64) -> bool {
 		let mut l = start;
 		let mut r = start + size;
-		
+
 		if let Some((&l_range, _)) = self.map.range(..=(l, u64::MAX)).last() {
 			if l_range.0 + l_range.1 >= r {
 				// [l, r) contained entirely inside l_range
@@ -434,7 +440,7 @@ impl SourceRanges {
 				self.map.remove(&l_range);
 			}
 		}
-		
+
 		if let Some((&r_range, _)) = self.map.range((r, 0)..).next() {
 			if r_range.0 <= r {
 				// extend right
@@ -442,7 +448,7 @@ impl SourceRanges {
 				self.map.remove(&r_range);
 			}
 		}
-		
+
 		// delete subranges of [l,r)
 		// (only subranges will overlap [l,r] now)
 		// unfortunately there's no BTreeMap::drain yet.
@@ -454,12 +460,12 @@ impl SourceRanges {
 		for key in keys {
 			self.map.remove(&key);
 		}
-		
+
 		// insert [l,r)
 		self.map.insert((l, r - l), 0);
 		true
 	}
-	
+
 	/// Where should the given source offset map to in the final executable's data section?
 	fn translate_offset(&self, offset: u64) -> Option<u64> {
 		let (range, &out) = self.map.range(..=(offset, u64::MAX)).last()?;
@@ -469,7 +475,7 @@ impl SourceRanges {
 			None
 		}
 	}
-	
+
 	/// Set output data offsets.
 	///
 	/// `*size` is the size of the data section so far.
@@ -477,7 +483,7 @@ impl SourceRanges {
 		for (range, value) in self.map.iter_mut() {
 			// we should only call this function once
 			assert_eq!(*value, 0);
-			
+
 			*value = *size;
 			*size += range.1;
 		}
@@ -492,30 +498,32 @@ struct RangeSet {
 
 impl RangeSet {
 	fn new(source_count: usize) -> Self {
-		Self { ranges: vec![SourceRanges::new(); source_count] }
+		Self {
+			ranges: vec![SourceRanges::new(); source_count],
+		}
 	}
-	
+
 	/// Add the range `start..start+size` in `source`.
 	///
 	/// Returns false if this range was already fully included.
 	fn add(&mut self, source: SourceId, start: u64, size: u64) -> bool {
 		self.ranges[source.0 as usize].add(start, size)
 	}
-	
+
 	/// Figure out output data offsets.
 	///
 	/// This needs to be called *after* adding all the ranges,
 	/// since later ranges might affect the optimal address
 	/// of earlier ranges, e.g. if `g` was added after `f` in the
 	/// example [here](SourceRanges).
-	fn to_map(mut self) -> OffsetMap {
+	fn into_map(mut self) -> OffsetMap {
 		let mut size = 0u64;
 		for range in self.ranges.iter_mut() {
 			range.set_output_offsets(&mut size)
 		}
 		OffsetMap {
 			size,
-			ranges: mem::take(&mut self.ranges)
+			ranges: mem::take(&mut self.ranges),
 		}
 	}
 }
@@ -532,17 +540,17 @@ impl OffsetMap {
 	fn translate_offset(&self, src: SourceId, offset: u64) -> Option<u64> {
 		self.ranges[src.0 as usize].translate_offset(offset)
 	}
-	
+
 	/// get offset in data section where relocation should be applied
 	fn translate_rel_offset(&self, rel: &Relocation) -> Option<u64> {
 		self.translate_offset(rel.r#where.0, rel.r#where.1)
 	}
-	
+
 	/// total size of data section
 	fn size(&self) -> u64 {
 		self.size
 	}
-	
+
 	/// Call `f` for each data range with parameters
 	/// `(source, source_offset, size, dest_offset)`.
 	/// (this indicates `source_offset..source_offset+size` in `source`
@@ -573,7 +581,7 @@ struct LinkerOutput {
 	relocations: Vec<(Relocation, u64)>,
 	/// contents of dynamic strtab.
 	strtab: Vec<u8>,
-	/// (offset into strtab, type) 
+	/// (offset into strtab, type)
 	/// Seems like no one sets the type of undefined symbols.
 	/// Still, might as well pretend they do.
 	dynsyms: HashMap<SymbolName, (u64, elf::SymbolType)>,
@@ -668,12 +676,11 @@ impl LinkerOutput {
 	pub fn bss_addr(&self) -> Option<u64> {
 		self.bss.map(|(a, _)| a)
 	}
-	
+
 	/// set data section
 	pub fn set_data(&mut self, data: Vec<u8>) {
 		self.data = data;
 	}
-
 
 	/// get the actual value of a [SymbolValue]
 	pub fn eval_symbol_value(&self, map: &OffsetMap, value: &SymbolValue) -> u64 {
@@ -683,7 +690,7 @@ impl LinkerOutput {
 				match map.translate_offset(*source, *offset) {
 					// in theory, this should only be None when we emitted a warning
 					// about a fucked up relocation
-					None => return 0,
+					None => 0,
 					Some(o) => o + self.data_addr(),
 				}
 			}
@@ -700,11 +707,11 @@ impl LinkerOutput {
 	pub fn write(&self, mut out: impl Write + Seek, entry_point: u64) -> LinkResult<()> {
 		let u64_to_u32 = LinkError::u64_to_u32;
 		let usize_to_u32 = LinkError::usize_to_u32;
-		
+
 		fn stream_position32(out: &mut impl Seek) -> LinkResult<u32> {
 			LinkError::u64_to_u32(out.stream_position()?)
 		}
-		
+
 		let load_addr = u64_to_u32(self.load_addr)?;
 
 		// start by writing data.
@@ -871,7 +878,7 @@ impl LinkerOutput {
 impl<'a> Linker<'a> {
 	pub const DEFAULT_CFLAGS: [&str; 5] = ["-Wall", "-Os", "-m32", "-fno-pic", "-c"];
 	pub const DEFAULT_CXXFLAGS: [&str; 5] = Self::DEFAULT_CFLAGS;
-	
+
 	fn default_warning_handler(warning: LinkWarning) {
 		eprintln!("warning: {warning}");
 	}
@@ -898,7 +905,7 @@ impl<'a> Linker<'a> {
 			warn: Box::new(Self::default_warning_handler),
 		}
 	}
-	
+
 	/// Set the C compiler.
 	pub fn set_cc(&mut self, cc: &str) {
 		self.cc = cc.into();
@@ -911,7 +918,7 @@ impl<'a> Linker<'a> {
 	pub fn set_cflags(&mut self, cflags: &[String]) {
 		self.cflags = cflags.to_vec();
 	}
-	
+
 	/// Set the C++ compiler.
 	pub fn set_cxx(&mut self, cxx: &str) {
 		self.cxx = cxx.into();
@@ -931,12 +938,12 @@ impl<'a> Linker<'a> {
 		source: SourceId,
 		elf: &elf::Reader32LE,
 		symbol: &elf::Symbol,
-	) -> Result<(), ObjectError> {
+	) -> ObjectResult<()> {
 		let name = elf.symbol_name(symbol)?;
-//		let dbg_name = name.clone();
+		//		let dbg_name = name.clone();
 		let name_id = self.symbol_names.add(name);
 		let size = symbol.size;
-		
+
 		let value = match symbol.value {
 			elf::SymbolValue::Undefined => None,
 			elf::SymbolValue::Absolute(n) => Some(SymbolValue::Absolute(n)),
@@ -944,7 +951,11 @@ impl<'a> Linker<'a> {
 				match elf.section_type(shndx) {
 					Some(elf::SectionType::ProgBits) => {
 						let offset = elf.section_offset(shndx).unwrap() + sec_offset;
-						Some(SymbolValue::Data { source, offset, size })
+						Some(SymbolValue::Data {
+							source,
+							offset,
+							size,
+						})
 					}
 					Some(elf::SectionType::NoBits) => {
 						let p = self.bss_size;
@@ -971,13 +982,9 @@ impl<'a> Linker<'a> {
 	/// add an object file (.o).
 	/// name doesn't need to correspond to the actual file name.
 	/// it only exists for debugging purposes.
-	pub fn add_object(
-		&mut self,
-		name: &str,
-		reader: impl BufRead + Seek,
-	) -> Result<(), ObjectError> {
+	pub fn add_object(&mut self, name: &str, reader: impl BufRead + Seek) -> ObjectResult<()> {
 		use ObjectError::*;
-		
+
 		let source_id = SourceId(self.sources.len() as _);
 
 		let elf = elf::Reader32LE::new(reader)?;
@@ -992,17 +999,20 @@ impl<'a> Linker<'a> {
 		let mut relocations = BTreeMap::new();
 		for rel in elf.relocations() {
 			let sym = self.symbol_names.add(elf.symbol_name(&rel.symbol)?);
-			relocations.insert(rel.offset, Relocation {
-				r#where: (source_id, rel.offset),
-				sym,
-				symbol_type: rel.symbol.r#type,
-				r#type: rel.r#type,
-				addend: rel.addend,
-				#[cfg(debug_assertions)]
-				entry_offset: rel.entry_offset,
-			});
+			relocations.insert(
+				rel.offset,
+				Relocation {
+					r#where: (source_id, rel.offset),
+					sym,
+					symbol_type: rel.symbol.r#type,
+					r#type: rel.r#type,
+					addend: rel.addend,
+					#[cfg(debug_assertions)]
+					entry_offset: rel.entry_offset,
+				},
+			);
 		}
-		
+
 		self.relocations.push(relocations);
 		self.sources.push(name.into());
 		self.source_data.push(elf.to_data());
@@ -1010,7 +1020,7 @@ impl<'a> Linker<'a> {
 		Ok(())
 	}
 
-	pub fn add_object_from_file(&mut self, path: impl AsRef<path::Path>) -> Result<(), ObjectError> {
+	pub fn add_object_from_file(&mut self, path: impl AsRef<path::Path>) -> ObjectResult<()> {
 		let path = path.as_ref();
 		let file = fs::File::open(path)?;
 		let mut file = io::BufReader::new(file);
@@ -1019,17 +1029,17 @@ impl<'a> Linker<'a> {
 
 	/// Add a dynamic library (.so). `name` can be a full path or
 	/// something like "libc.so.6" --- any string you would pass to `dlopen`.
-	pub fn add_dynamic_library(&mut self, name: &str) -> Result<(), ObjectError> {
+	pub fn add_dynamic_library(&mut self, name: &str) -> ObjectResult<()> {
 		self.libraries.push(name.into());
 		Ok(())
 	}
-	
-	fn compile(&self, compiler: &str, flags: &[String], path: &str) -> Result<String, ObjectError> {
+
+	fn compile(&self, compiler: &str, flags: &[String], path: &str) -> ObjectResult<String> {
 		use std::process::Command;
-		
+
 		let ext_idx = path.rfind('.').unwrap_or(path.len());
 		let output_filename = path[..ext_idx].to_string() + ".o";
-		
+
 		let status = Command::new(compiler)
 			.args(flags)
 			.arg(path)
@@ -1042,19 +1052,19 @@ impl<'a> Linker<'a> {
 			Err(ObjectError::CommandFailed(status))
 		}
 	}
-	
+
 	/// Add a C file (.c). This calls out to an external C compiler.
-	pub fn add_c(&mut self, path: &str) -> Result<(), ObjectError> {
+	pub fn add_c(&mut self, path: &str) -> ObjectResult<()> {
 		let output = self.compile(&self.cc, &self.cflags, path)?;
 		self.add_object_from_file(&output)
 	}
-	
+
 	/// Add a C++ file (.cpp/.cc/etc). This calls out to an external C++ compiler.
-	pub fn add_cpp(&mut self, path: &str) -> Result<(), ObjectError> {
+	pub fn add_cpp(&mut self, path: &str) -> ObjectResult<()> {
 		let output = self.compile(&self.cxx, &self.cxxflags, path)?;
 		self.add_object_from_file(&output)
 	}
-	
+
 	/// Easy input API.
 	/// Infers the file type of input, and calls the appropriate function (e.g. [Self::add_object]).
 	pub fn add_input(&mut self, input: &str) -> Result<(), String> {
@@ -1075,8 +1085,11 @@ impl<'a> Linker<'a> {
 			if input.ends_with(".c") {
 				return C;
 			}
-			if input.ends_with(".cpp") || input.ends_with(".cc") || input.ends_with(".cxx")
-				|| input.ends_with(".C") {
+			if input.ends_with(".cpp")
+				|| input.ends_with(".cc")
+				|| input.ends_with(".cxx")
+				|| input.ends_with(".C")
+			{
 				return CPlusPlus;
 			}
 			if input.ends_with(".so") {
@@ -1090,18 +1103,15 @@ impl<'a> Linker<'a> {
 		}
 
 		match file_type(input) {
-			Object => {
-				self.add_object_from_file(input)
-					.map_err(|e| format!("Failed to process object file {input}: {e}"))
-			}
-			C => {
-				self.add_c(input)
-					.map_err(|e| format!("Failed to process C file {input}: {e}"))
-			},
-			CPlusPlus => {
-				self.add_cpp(input)
-					.map_err(|e| format!("Failed to process C++ file {input}: {e}"))
-			},
+			Object => self
+				.add_object_from_file(input)
+				.map_err(|e| format!("Failed to process object file {input}: {e}")),
+			C => self
+				.add_c(input)
+				.map_err(|e| format!("Failed to process C file {input}: {e}")),
+			CPlusPlus => self
+				.add_cpp(input)
+				.map_err(|e| format!("Failed to process C++ file {input}: {e}")),
 			DynamicLibrary => self
 				.add_dynamic_library(input)
 				.map_err(|e| format!("Failed to process library file {input}: {e}")),
@@ -1119,7 +1129,7 @@ impl<'a> Linker<'a> {
 	fn get_symbol_id(&self, source_id: SourceId, name: SymbolName) -> Option<SymbolId> {
 		self.symbols.get_id_from_name(source_id, name)
 	}
-	
+
 	/// Get value of symbol (e.g. ID of main → address of main).
 	fn get_symbol_value(&self, map: &OffsetMap, exec: &LinkerOutput, sym: SymbolId) -> u64 {
 		let info = self.symbols.get_info_from_id(sym);
@@ -1130,11 +1140,13 @@ impl<'a> Linker<'a> {
 		&self.sources[id.0 as usize]
 	}
 
-
 	/// Apply relocation to executable.
 	fn apply_relocation(&self, exec: &mut LinkerOutput, map: &OffsetMap, rel: &Relocation) {
 		let warn_oob = || {
-			self.emit_warning(LinkWarning::RelOOB(self.source_name(rel.r#where.0).into(), rel.r#where.1));
+			self.emit_warning(LinkWarning::RelOOB(
+				self.source_name(rel.r#where.0).into(),
+				rel.r#where.1,
+			));
 		};
 		let apply_offset = match map.translate_rel_offset(rel) {
 			Some(data_offset) => data_offset,
@@ -1155,7 +1167,7 @@ impl<'a> Linker<'a> {
 		};
 
 		let symbol_value = self.get_symbol_value(map, exec, symbol);
-		
+
 		// guarantee failure if apply_offset can't be converted to usize.
 		// (this will probably never happen)
 		let apply_start = apply_offset.try_into().unwrap_or(usize::MAX - 1000);
@@ -1164,9 +1176,9 @@ impl<'a> Linker<'a> {
 			return;
 		}
 		let data = &mut exec.data[apply_start..];
-		
+
 		let current_val = u64::from_le_bytes([
-			data.get(0).copied().unwrap_or(0),
+			data.first().copied().unwrap_or(0),
 			data.get(1).copied().unwrap_or(0),
 			data.get(2).copied().unwrap_or(0),
 			data.get(3).copied().unwrap_or(0),
@@ -1175,10 +1187,12 @@ impl<'a> Linker<'a> {
 			data.get(6).copied().unwrap_or(0),
 			data.get(7).copied().unwrap_or(0),
 		]);
-		
+
 		// value of relocation not taking rel.r#type into account.
-		let base_value = symbol_value.wrapping_add(rel.addend as u64).wrapping_add(current_val.into());
-		
+		let base_value = symbol_value
+			.wrapping_add(rel.addend as u64)
+			.wrapping_add(current_val);
+
 		use elf::RelType::*;
 		let (value, size) = match rel.r#type {
 			Direct32 => (base_value & u64::from(u32::MAX), 4),
@@ -1186,16 +1200,15 @@ impl<'a> Linker<'a> {
 			Other(x) => {
 				self.emit_warning(LinkWarning::RelUnsupported(x));
 				return;
-			},
+			}
 		};
-		
+
 		if data.len() < size {
 			warn_oob();
 			return;
 		}
 		data[..size].copy_from_slice(&u64::to_le_bytes(value)[..size]);
 	}
-
 
 	fn require_range(&self, ranges: &mut RangeSet, source: SourceId, offset: u64, size: u64) {
 		if ranges.add(source, offset, size) {
@@ -1204,14 +1217,19 @@ impl<'a> Linker<'a> {
 				let (source, _off) = rel.r#where;
 				if let Some(symbol) = self.get_symbol_id(source, rel.sym) {
 					let value = &self.symbols.get_info_from_id(symbol).value;
-					if let &SymbolValue::Data { source: req_source, offset: req_offset, size: req_size } = value {
+					if let &SymbolValue::Data {
+						source: req_source,
+						offset: req_offset,
+						size: req_size,
+					} = value
+					{
 						self.require_range(ranges, req_source, req_offset, req_size);
 					} // else, it's okay, it's a bss relocation or something hopefully
 				} // else, we'll deal with it in apply_relocation
 			}
 		}
 	}
-	
+
 	/// Link everything together.
 	pub fn link(&self, out: impl Write + Seek, entry: &str) -> LinkResult<()> {
 		let mut exec = LinkerOutput::new(0x400000);
@@ -1233,36 +1251,41 @@ impl<'a> Linker<'a> {
 			.symbols
 			.get_id_from_name(SourceId::NONE, entry_name_id)
 			.ok_or_else(|| LinkError::EntryNotDefined(entry.into()))?;
-		
+
 		let mut ranges = RangeSet::new(self.sources.len());
-		
+
 		let entry_value = &self.symbols.get_info_from_id(entry_id).value;
 		let (entry_source, entry_offset, entry_size) = match entry_value {
-			SymbolValue::Data { source, offset, size } => (*source, *offset, *size),
+			SymbolValue::Data {
+				source,
+				offset,
+				size,
+			} => (*source, *offset, *size),
 			_ => return Err(LinkError::EntryNoData(entry.into())),
 		};
-		
+
 		self.require_range(&mut ranges, entry_source, entry_offset, entry_size);
-		
+
 		// compute offset map
-		let offset_map = ranges.to_map();
-		
+		let offset_map = ranges.into_map();
+
 		let mut data_section = vec![0; offset_map.size() as usize];
-		
-		offset_map.for_each(|source: SourceId, src_offset: u64, size: u64, dest_offset: u64| {
-			let dest_start = dest_offset as usize;
-			let dest_end = dest_start + size as usize;
-			let src_start = src_offset as usize;
-			let src_end = src_start + size as usize;
-			//let dest_addr = dest_offset + exec.data_addr();
-			//println!("{source:?}@{src_offset:x} => {:x}..{:x}", dest_addr,dest_addr+size); 
-			data_section[dest_start..dest_end].copy_from_slice(
-				&self.source_data[source.0 as usize][src_start..src_end]
-			);
-		});
-		
+
+		offset_map.for_each(
+			|source: SourceId, src_offset: u64, size: u64, dest_offset: u64| {
+				let dest_start = dest_offset as usize;
+				let dest_end = dest_start + size as usize;
+				let src_start = src_offset as usize;
+				let src_end = src_start + size as usize;
+				//let dest_addr = dest_offset + exec.data_addr();
+				//println!("{source:?}@{src_offset:x} => {:x}..{:x}", dest_addr,dest_addr+size);
+				data_section[dest_start..dest_end]
+					.copy_from_slice(&self.source_data[source.0 as usize][src_start..src_end]);
+			},
+		);
+
 		exec.set_data(data_section);
-		
+
 		for rel_map in self.relocations.iter() {
 			for rel in rel_map.values() {
 				self.apply_relocation(&mut exec, &offset_map, rel);
@@ -1270,7 +1293,9 @@ impl<'a> Linker<'a> {
 		}
 
 		// this should never panic, since we did require_range on the entry point.
-		let entry_addr = offset_map.translate_offset(entry_source, entry_offset).unwrap() + exec.data_addr();
+		let entry_addr = offset_map
+			.translate_offset(entry_source, entry_offset)
+			.unwrap() + exec.data_addr();
 		exec.write(out, entry_addr)
 	}
 
