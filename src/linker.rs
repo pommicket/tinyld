@@ -121,6 +121,8 @@ pub enum LinkWarning {
 	RelUnsupported(u8),
 	/// relocation is too large
 	RelOOB(String, u64),
+	/// multiple definitions of a symbol
+	MultipleDefinitions(String),
 }
 
 impl fmt::Display for LinkWarning {
@@ -129,6 +131,7 @@ impl fmt::Display for LinkWarning {
 		match self {
 			RelOOB(source, offset) => write!(f, "relocation {source}+0x{offset:x} goes outside of its section (it will be ignored)."),
 			RelUnsupported(x) => write!(f, "Unsupported relocation type {x} (relocation ignored)."),
+			MultipleDefinitions(name) => write!(f, "Symbol {name} has multiple definitions. One of them will be chosen arbitrarily."),
 		}
 	}
 }
@@ -940,9 +943,12 @@ impl<'a> Linker<'a> {
 		symbol: &elf::Symbol,
 	) -> ObjectResult<()> {
 		let name = elf.symbol_name(symbol)?;
-		//		let dbg_name = name.clone();
 		let name_id = self.symbol_names.add(name);
 		let size = symbol.size;
+
+		if self.symbols.get_id_from_name(source, name_id).is_some() {
+			self.emit_warning(LinkWarning::MultipleDefinitions(elf.symbol_name(symbol)?));
+		}
 
 		let value = match symbol.value {
 			elf::SymbolValue::Undefined => None,

@@ -1,8 +1,5 @@
 /*
 @TODO:
-- what happens when a symbol has two definitions? can this happen with multiple c++ files which use the same template?
-- disable "warning: relocation XXX not in a data/text section" for .rel.eh_frame + maybe others
-	- these warnings are being generated in two places. do they need to be?
 - make executables more tiny (overlap sections, etc.)
 - generate a warning/error on position-independent object files
 - static libraries
@@ -28,7 +25,7 @@ struct Args {
 	no_std_lib: bool,
 	/// If set, the program will be linked against libstdc++.
 	///
-	/// This is needed when using the standard template library.
+	/// This is needed when using any C++ library functions.
 	#[arg(long = "stdc++", default_value_t = false)]
 	std_cpp: bool,
 	/// Output executable path.
