@@ -4,11 +4,10 @@ Linker producing small executables.
 Smallness is the *only* goal.
 This linker makes "bad" executables in many ways. For example,
 all initialized data will be executable. All code will be writable.
+There's no debugging information.
 You shouldn't use this unless all you want is a tiny little executable file.
 
 Currently, only 32-bit ELF is supported.
-If you are using C/C++, you will need `gcc-multilib` for the 32-bit headers.
-If you're using C++, you'll need `g++-multilib` too.
 
 Position-independent code is NOT supported, and makes executables
 larger anyways. Make sure you compile with `-fno-pic` or equivalent.
@@ -22,9 +21,40 @@ linker.add_input("libstdc++.so.6")?;
 linker.link_to_file("a.out", "entry")?;
 ```
 
-`.eh_frame` and any debugging information is ignored.
-As such, the resulting executable will be difficult to debug and *C++ exceptions
-may not work*. 
+Notes about using C/C++:
+
+- You need to call exit or do an exit syscall at the end of your entry function.
+  Otherwise you will get a segfault/illegal instruction/etc:
+```c
+(extern "C") void entry() {
+	...
+	exit(0);
+}
+```
+- You will need `gcc-multilib` for the 32-bit headers.
+
+Notes about using C++:
+
+- I recommend you do something like this:
+```c
+extern "C" void entry() {
+	exit(main());
+}
+int main() {
+	...
+}
+```
+This ensures that all destructors are called for local objects in main.
+- You will need `g++-multilib`.
+- Exceptions may not work (since `.eh_frame` is stripped).
+- If you want a small executable, it's best not to use the STL.
+- For some reason, `std::cout` and `std::cin` don't work. If you can figure out why, please let me know.
+  You can get around this with something like
+```
+std::ofstream cout("/dev/stdout");
+std::ifstream cin("/dev/stdin");
+```
+or use `printf`, `scanf` for smaller executables.
 */
 
 use crate::elf;
@@ -1060,9 +1090,8 @@ impl<'a> Linker<'a> {
 		&self.sources[id.0 as usize]
 	}
 
+	// @TODO: move me back into apply_relocation
 	/// The value of the relocation *before* taking its type into account.
-	/// This is used to determine the actual value of the relocation, as well as
-	/// for figuring out what data a relocation "depends on".
 	fn relocation_absolute_value(&self, rel: &Relocation, symbol_value: u64, current_data: &[u8]) -> Result<u64, LinkWarning> {
 		// currently this only deals with 32-bit relocations
 		if current_data.len() < 4 {
@@ -1110,7 +1139,7 @@ impl<'a> Linker<'a> {
 			Ok(value) => {
 				let (value, size) = match rel.r#type {
 					Direct32 => (value & u64::from(u32::MAX), 4),
-					Pc32 => ((value - pc) & u64::from(u32::MAX), 4),
+					Pc32 => (value.wrapping_sub(pc) & u64::from(u32::MAX), 4),
 					Other(x) => {
 						self.emit_warning(LinkWarning::RelUnsupported(x));
 						return Ok(())
@@ -1131,11 +1160,13 @@ impl<'a> Linker<'a> {
 		if ranges.add(source, offset, size) {
 			let src_idx = usize::try_from(source.0).unwrap();
 			for (_, rel) in self.relocations[src_idx].range(offset..offset + size) {
-				let (source, off) = rel.r#where;
+				let (source, _off) = rel.r#where;
 				if let Some(symbol) = self.get_symbol_id(source, rel.sym) {
 					let value = &self.symbols.get_info_from_id(symbol).value;
 					if let &SymbolValue::Data { source: req_source, offset: req_offset, size: req_size } = value {
 						self.require_range(ranges, req_source, req_offset, req_size);
+						
+						// @TODO: delete
 // 						let off_idx = usize::try_from(off).unwrap_or(usize::MAX);
 // 						let curr_value = self.source_data[src_idx].get(off_idx..).unwrap_or(&[]);
 // 						if let Ok(range_start) = self.relocation_absolute_value(rel, req_offset, curr_value) {

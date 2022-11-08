@@ -1,22 +1,25 @@
 #include <vector>
-#include <iostream>
+#include <fstream>
 #include <algorithm>
 #include <climits>
 
 extern "C" int main() {
 	std::vector<int> numbers = {};
 	
+	std::ofstream cout("/dev/stdout");
+	std::ifstream cin("/dev/stdin");
+// 	
 	while (1) {
 		int n = INT_MIN;
-		std::cin >> n;
+		cin >> n;
 		if (n == INT_MIN) break;
 		numbers.push_back(n);
 	}
 	
-	//std::sort(numbers.begin(), numbers.end());
-	
+	std::sort(numbers.begin(), numbers.end());
+// 	
 	for (int n: numbers)
-		std::cout << n << std::endl;
+		cout << n << std::endl;
 	
 	exit(0);
 }

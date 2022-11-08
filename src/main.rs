@@ -1,6 +1,6 @@
 /*
 @TODO:
-- "@TODO : else?"
+- @TODOs
 - get rid of RelNoSym if not needed
 - ObjectResult
 - what happens when a symbol has two definitions? can this happen with multiple c++ files which use the same template?
