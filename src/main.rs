@@ -1,13 +1,8 @@
-/*
-@TODO:
-- static libraries
-*/
-
 extern crate clap;
 
-use std::io;
-use io::Write;
 use clap::Parser;
+use io::Write;
+use std::io;
 
 #[cfg(target_endian = "big")]
 compile_error! {"WHY do you have a big endian machine???? it's the 21st century, buddy. this program won't work fuck you"}
@@ -110,16 +105,16 @@ fn main_() -> Result<(), String> {
 	if args.verbose {
 		print!("linking {}... ", args.output);
 	}
-	
+
 	io::stdout().flush().unwrap_or(());
 	let info = linker.link_to_file(&args.output, &args.entry)?;
-	
+
 	if args.verbose {
 		println!("\x1b[92msuccess!\x1b[0m");
 		println!("data size:      {:7} bytes", info.data_size);
 		println!("executable size:{:7} bytes", info.exec_size);
 	}
-	
+
 	Ok(())
 }
 

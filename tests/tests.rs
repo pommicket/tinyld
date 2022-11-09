@@ -92,6 +92,53 @@ mod tests {
 	}
 
 	#[test]
+	fn static_lib_c() {
+		// compile .o files
+		let status = Command::new("gcc")
+			.args(&[
+				"-m32",
+				"-fno-pic",
+				"-c",
+				&file("static-lib1.c"),
+				"-o",
+				&file("static-lib1.o"),
+			])
+			.status()
+			.unwrap();
+		assert!(status.success());
+		let status = Command::new("gcc")
+			.args(&[
+				"-m32",
+				"-fno-pic",
+				"-c",
+				&file("static-lib2-long-name.c"),
+				"-o",
+				&file("static-lib2-long-name.o"),
+			])
+			.status()
+			.unwrap();
+		assert!(status.success());
+		// make .a file
+		let status = Command::new("ar")
+			.args(&[
+				"rc",
+				&file("static-lib.a"),
+				&file("static-lib1.o"),
+				&file("static-lib2-long-name.o"),
+			])
+			.status()
+			.unwrap();
+		assert!(status.success());
+		let mut linker = test_linker();
+		add(&mut linker, "static-lib.a", true);
+		add(&mut linker, "static-lib-test.c", true);
+		add(&mut linker, "libc.so.6", false);
+		link(&linker, "static-lib-test.out", "entry");
+		let output = run("static-lib-test.out");
+		assert_eq!(output.stdout, b"call 1\n18\ncall 2\n19\n");
+	}
+
+	#[test]
 	fn cpp() {
 		let mut linker = test_linker();
 		add(&mut linker, "cpp.cpp", true);

@@ -27,8 +27,8 @@ Notes about using C/C++:
   Otherwise you will get a segfault/illegal instruction/etc:
 ```c
 (extern "C") void entry() {
-    ...
-    exit(0);
+	...
+	exit(0);
 }
 ```
 - You will need `gcc-multilib` for the 32-bit headers.
@@ -38,10 +38,10 @@ Notes about using C++:
 - I recommend you do something like this:
 ```c
 extern "C" void entry() {
-    exit(main());
+	exit(main());
 }
 int main() {
-    ...
+	...
 }
 ```
 This ensures that all destructors are called for local objects in main.
@@ -65,14 +65,16 @@ Notes on executable size:
   it is used. It (thankfully) doesn't seem to be worth it to use `dlsym`.
 */
 
-use crate::elf;
+use crate::{ar, elf};
 use io::{BufRead, Seek, Write};
 use std::collections::{BTreeMap, HashMap};
 use std::{fmt, fs, io, mem, path};
 
+use ar::Archive;
 use elf::Reader as ELFReader;
 use elf::ToBytes;
 
+#[derive(Debug)]
 pub enum LinkError {
 	IO(io::Error),
 	/// executable is too large (>4GB on 32-bit platforms)
@@ -124,6 +126,7 @@ impl From<&LinkError> for String {
 	}
 }
 
+#[derive(Debug)]
 pub enum LinkWarning {
 	/// unsupported relocation type
 	RelUnsupported(u8),
@@ -154,10 +157,13 @@ impl From<&LinkWarning> for String {
 }
 
 /// error produced by [Linker::add_object]
+#[derive(Debug)]
 pub enum ObjectError {
 	IO(io::Error),
 	/// ELF format error
 	Elf(elf::Error),
+	/// Static library (.a) format error
+	Archive(ar::Error),
 	/// wrong type of ELF file
 	BadType,
 	/// compile command failed
@@ -178,6 +184,12 @@ impl From<elf::Error> for ObjectError {
 	}
 }
 
+impl From<ar::Error> for ObjectError {
+	fn from(e: ar::Error) -> Self {
+		Self::Archive(e)
+	}
+}
+
 impl From<&ObjectError> for String {
 	fn from(e: &ObjectError) -> String {
 		format!("{e}")
@@ -190,6 +202,7 @@ impl fmt::Display for ObjectError {
 		match self {
 			IO(e) => write!(f, "{e}"),
 			Elf(e) => write!(f, "{e}"),
+			Archive(e) => write!(f, "{e}"),
 			BadType => write!(f, "wrong type of ELF file (not an object file)"),
 			CommandFailed(status) => write!(f, "command failed: {status}"),
 		}
@@ -890,11 +903,11 @@ impl LinkerOutput {
 			};
 			out.write_all(&phdr_dynamic.to_bytes())?;
 		}
-		
+
 		out.seek(io::SeekFrom::End(0))?;
 		Ok(LinkInfo {
 			data_size: self.data.len() as u64,
-			exec_size: out.stream_position()?
+			exec_size: out.stream_position()?,
 		})
 	}
 }
@@ -980,13 +993,9 @@ impl<'a> Linker<'a> {
 		if name == "_GLOBAL_OFFSET_TABLE_" {
 			self.emit_warning(LinkWarning::MaybePic(self.source_name(source).into()));
 		}
-		
+
 		let name_id = self.symbol_names.add(name);
 		let size = symbol.size;
-
-		if self.symbols.get_id_from_name(source, name_id).is_some() {
-			self.emit_warning(LinkWarning::MultipleDefinitions(elf.symbol_name(symbol)?));
-		}
 
 		let value = match symbol.value {
 			elf::SymbolValue::Undefined => None,
@@ -1012,6 +1021,10 @@ impl<'a> Linker<'a> {
 		};
 
 		if let Some(value) = value {
+			if self.symbols.get_id_from_name(source, name_id).is_some() {
+				self.emit_warning(LinkWarning::MultipleDefinitions(elf.symbol_name(symbol)?));
+			}
+
 			let info = SymbolInfo { value };
 			match symbol.bind {
 				elf::SymbolBind::Local => self.symbols.add_local(source, name_id, info),
@@ -1023,9 +1036,10 @@ impl<'a> Linker<'a> {
 		Ok(())
 	}
 
-	/// add an object file (.o).
-	/// name doesn't need to correspond to the actual file name.
-	/// it only exists for debugging purposes.
+	/// Add an object file (.o).
+	///
+	/// `name` doesn't need to correspond to the actual file name.
+	/// It only exists for debugging purposes.
 	pub fn add_object(&mut self, name: &str, reader: impl BufRead + Seek) -> ObjectResult<()> {
 		use ObjectError::*;
 
@@ -1069,6 +1083,38 @@ impl<'a> Linker<'a> {
 		let file = fs::File::open(path)?;
 		let mut file = io::BufReader::new(file);
 		self.add_object(&path.to_string_lossy(), &mut file)
+	}
+
+	/// Add a static library (.a)
+	///
+	/// `name` doesn't need to correspond to the actual file name.
+	/// It only exists for debugging purposes.
+	pub fn add_static_library(
+		&mut self,
+		name: &str,
+		reader: impl BufRead + Seek,
+	) -> ObjectResult<()> {
+		let mut archive = Archive::new(reader)?;
+		for i in 0..archive.file_count() {
+			let mut objname = String::from(name);
+			objname.push('(');
+			objname += archive.file_name(i);
+			objname.push(')');
+			let bytes = archive.file_data(i)?;
+			let reader = io::Cursor::new(&bytes[..]);
+			self.add_object(&objname, reader)?;
+		}
+		Ok(())
+	}
+
+	pub fn add_static_library_from_file(
+		&mut self,
+		path: impl AsRef<path::Path>,
+	) -> ObjectResult<()> {
+		let path = path.as_ref();
+		let file = fs::File::open(path)?;
+		let mut file = io::BufReader::new(file);
+		self.add_static_library(&path.to_string_lossy(), &mut file)
 	}
 
 	/// Add a dynamic library (.so). `name` can be a full path or
@@ -1115,6 +1161,7 @@ impl<'a> Linker<'a> {
 		enum FileType {
 			Object,
 			DynamicLibrary,
+			StaticLibrary,
 			C,
 			CPlusPlus,
 			Other,
@@ -1128,6 +1175,9 @@ impl<'a> Linker<'a> {
 			}
 			if input.ends_with(".c") {
 				return C;
+			}
+			if input.ends_with(".a") {
+				return StaticLibrary;
 			}
 			if input.ends_with(".cpp")
 				|| input.ends_with(".cc")
@@ -1159,6 +1209,9 @@ impl<'a> Linker<'a> {
 			DynamicLibrary => self
 				.add_dynamic_library(input)
 				.map_err(|e| format!("Failed to process library file {input}: {e}")),
+			StaticLibrary => self
+				.add_static_library_from_file(input)
+				.map_err(|e| format!("Failed to process static library {input}: {e}")),
 			Other => Err(format!("Unrecognized file type: {input}")),
 		}
 	}
@@ -1349,7 +1402,11 @@ impl<'a> Linker<'a> {
 	/// Instead, define `void <main/entry/something_else>(void)`, and make sure you call `exit`,
 	/// or do an exit system interrupt at the end of the function --- if you just return,
 	/// you'll get a segmentation fault.
-	pub fn link_to_file(&self, path: impl AsRef<path::Path>, entry: &str) -> Result<LinkInfo, String> {
+	pub fn link_to_file(
+		&self,
+		path: impl AsRef<path::Path>,
+		entry: &str,
+	) -> Result<LinkInfo, String> {
 		let path = path.as_ref();
 		let mut out_options = fs::OpenOptions::new();
 		out_options.write(true).create(true).truncate(true);
