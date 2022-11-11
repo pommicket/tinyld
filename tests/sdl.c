@@ -8,8 +8,10 @@ int main(void) {
 	SDL_Init(SDL_INIT_EVERYTHING);
 	SDL_Window *window = SDL_CreateWindow("hi", 0, 0, 1280, 720, SDL_WINDOW_SHOWN|SDL_WINDOW_OPENGL);
 	SDL_GLContext ctx = SDL_GL_CreateContext(window);
-	PFNGLCLEARPROC glClear = SDL_GL_GetProcAddress("glClear");
-	PFNGLCLEARCOLORPROC glClearColor = SDL_GL_GetProcAddress("glClearColor");
+	// we save a byte this way since we don't need an extra relocation.
+	void *(*volatile get_proc_address)() = SDL_GL_GetProcAddress;
+	PFNGLCLEARPROC glClear = get_proc_address("glClear");
+	PFNGLCLEARCOLORPROC glClearColor = get_proc_address("glClearColor");
 	SDL_GL_SetSwapInterval(1);
 	while (true) {
 		SDL_Event event;

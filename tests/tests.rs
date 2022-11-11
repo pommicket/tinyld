@@ -52,7 +52,7 @@ mod tests {
 	fn tiny_c() {
 		let mut linker = test_linker();
 		add(&mut linker, "tiny.c", true);
-		link(&linker, "test.out", "entry");
+		link(&linker, "tiny.out", "entry");
 		let output = run("tiny.out");
 		assert!(output.stdout.is_empty());
 	}
